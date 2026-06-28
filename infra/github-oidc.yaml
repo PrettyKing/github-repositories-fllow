@@ -47,6 +47,31 @@ Resources:
       # GitHub OIDC 根证书指纹（AWS 现已自动校验，仍保留以兼容旧区域）
       ThumbprintList: ["6938fd4d98bab03faadb97b34396831e3780aea1"]
 
+  # 权限边界：部署角色创建的任何 Lambda 角色，实际权限不得超过这里列的。
+  # 由本 bootstrap 栈（admin 凭据）创建，部署角色无权修改它 —— 这是防提权的核心。
+  LambdaPermissionsBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${DeployStackName}-lambda-boundary"
+      Description: 部署角色所建 Lambda 执行角色的权限上限
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - ec2:CreateNetworkInterface
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DeleteNetworkInterface
+              - ec2:AssignPrivateIpAddresses
+              - ec2:UnassignPrivateIpAddresses
+              - ec2:DescribeSubnets
+              - ec2:DescribeVpcs
+              - ec2:DescribeSecurityGroups
+            Resource: "*"
+
   DeployRole:
     Type: AWS::IAM::Role
     Properties:
@@ -96,17 +121,29 @@ Resources:
                 Resource:
                   - "arn:aws:s3:::aws-sam-cli-managed-*"
                   - "arn:aws:s3:::aws-sam-cli-managed-*/*"
-              # IAM 仅限本栈创建的角色（SAM 为 Lambda 建的执行角色名以栈名为前缀）
-              - Sid: StackRoles
+              # 创建/改写角色：强制必须挂上面的权限边界，且限本栈前缀。
+              # 这样即使注入 admin 内联策略，实际权限也被边界压住，无法提权。
+              - Sid: CreateOrModifyBoundedRoles
                 Effect: Allow
                 Action:
                   - iam:CreateRole
-                  - iam:DeleteRole
-                  - iam:GetRole
-                  - iam:AttachRolePolicy
-                  - iam:DetachRolePolicy
                   - iam:PutRolePolicy
                   - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePermissionsBoundary
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/${DeployStackName}-*"
+                Condition:
+                  StringEquals:
+                    iam:PermissionsBoundary: !Ref LambdaPermissionsBoundary
+              # 读取/删除/打标：限本栈前缀（删除角色不支持边界条件，靠前缀约束；
+              # 未授予 DeleteRolePermissionsBoundary，因此边界无法被剥离）
+              - Sid: ReadDeleteStackRoles
+                Effect: Allow
+                Action:
+                  - iam:GetRole
+                  - iam:DeleteRole
                   - iam:GetRolePolicy
                   - iam:ListRolePolicies
                   - iam:ListAttachedRolePolicies
@@ -133,3 +170,6 @@ Outputs:
   DeployRoleArn:
     Description: 填到 GitHub Secrets 的 AWS_DEPLOY_ROLE_ARN
     Value: !GetAtt DeployRole.Arn
+  LambdaBoundaryArn:
+    Description: Lambda 角色的权限边界 ARN（主栈会按名字引用它）
+    Value: !Ref LambdaPermissionsBoundary
