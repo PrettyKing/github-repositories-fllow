@@ -109,6 +109,19 @@ Hono 同时提供「一个页面」和「一组接口」（`apps/server/src/app.
 
 ## 部署到 AWS（SAM）
 
+### 已部署实例（ap-northeast-1）
+
+- **访问地址**：https://e7qrl1cohh.execute-api.ap-northeast-1.amazonaws.com
+- **登录**：用户名 `admin`，密码由 SAM 生成（不入库不进仓库），取密码：
+  ```bash
+  aws secretsmanager get-secret-value --region ap-northeast-1 \
+    --secret-id "arn:aws:secretsmanager:ap-northeast-1:151484827428:secret:AuthSecret-KViTH1A2fwyT-aArzsY" \
+    --query SecretString --output text
+  ```
+- **端到端已验证**：页面/鉴权、Lambda→Aurora（私有子网连库 + 自动建表）、Lambda→NAT→api.github.com（出网）均通过。
+
+> 验收完拆栈省钱：`sam delete --stack-name github-repositories-fllow --region ap-northeast-1`
+
 整套基础设施由 `template.yaml` 定义，一条命令拉起：**VPC（1 个公有子网 + IGW + NAT，2 个私有子网）+ Aurora PostgreSQL Serverless v2 + Lambda(Hono) + HTTP API**。Lambda 与 Aurora 同 VPC、在两个私有子网里；Lambda 经 NAT 出网调用 GitHub API。
 
 ```
