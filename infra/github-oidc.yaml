@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  一次性 bootstrap：创建 GitHub Actions OIDC Provider + 一个供 CI 假设的部署 Role。
+  CI 通过 OIDC 临时假设该 Role 部署主栈（template.yaml），仓库里不存任何长期密钥。
+
+  部署方法（本地装了 AWS CLI 时执行一次；也可在控制台用此模板建栈）：
+    aws cloudformation deploy \
+      --region ap-northeast-1 \
+      --stack-name github-oidc-deployer \
+      --capabilities CAPABILITY_NAMED_IAM \
+      --template-file infra/github-oidc.yaml \
+      --parameter-overrides GitHubOrg=<你的GitHub用户名> GitHubRepo=github-repositories-fllow
+
+  建好后把输出的 DeployRoleArn 填到 GitHub 仓库 Secrets: AWS_DEPLOY_ROLE_ARN。
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub 用户名或组织名
+  GitHubRepo:
+    Type: String
+    Default: github-repositories-fllow
+  DeployRegion:
+    Type: String
+    Default: ap-northeast-1
+    Description: 允许该 Role 操作的区域（限制爆炸半径）。
+  DeployStackName:
+    Type: String
+    Default: github-repositories-fllow
+    Description: 主栈名（用于把 IAM 资源收窄到该栈创建的角色）。
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: 账号里若已有 GitHub OIDC Provider，则填 false 复用。
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: ShouldCreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: ["sts.amazonaws.com"]
+      # GitHub OIDC 根证书指纹（AWS 现已自动校验，仍保留以兼容旧区域）
+      ThumbprintList: ["6938fd4d98bab03faadb97b34396831e3780aea1"]
+
+  DeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${GitHubRepo}-github-deployer"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - ShouldCreateOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                # 仅允许本仓库 main/master 分支的工作流假设该角色（不放开所有 ref/PR）
+                token.actions.githubusercontent.com:sub:
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/main"
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/master"
+      Policies:
+        - PolicyName: sam-deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # 区域内服务：限制在部署区域，缩小爆炸半径
+              - Sid: RegionalServices
+                Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - lambda:*
+                  - apigateway:*
+                  - ec2:*
+                  - rds:*
+                  - secretsmanager:*
+                  - logs:*
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref DeployRegion
+              # S3 仅限 SAM 托管的构建产物桶
+              - Sid: SamArtifactBucket
+                Effect: Allow
+                Action: s3:*
+                Resource:
+                  - "arn:aws:s3:::aws-sam-cli-managed-*"
+                  - "arn:aws:s3:::aws-sam-cli-managed-*/*"
+              # IAM 仅限本栈创建的角色（SAM 为 Lambda 建的执行角色名以栈名为前缀）
+              - Sid: StackRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/${DeployStackName}-*"
+              # PassRole 仅允许把本栈角色交给 Lambda
+              - Sid: PassRoleToLambda
+                Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/${DeployStackName}-*"
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: lambda.amazonaws.com
+              # RDS 等服务首次使用需要的服务关联角色
+              - Sid: ServiceLinkedRoles
+                Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: "*"
+
+Outputs:
+  DeployRoleArn:
+    Description: 填到 GitHub Secrets 的 AWS_DEPLOY_ROLE_ARN
+    Value: !GetAtt DeployRole.Arn

@@ -1,0 +1,3 @@
+{
+  "extends": "@github-repositories-fllow/config/tsconfig.base.json"
+}

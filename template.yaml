@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Hono(API + 页面) + Drizzle + Aurora PostgreSQL Serverless v2，部署在同一个 VPC：
+  1 个公有子网(IGW + NAT 对外上网) + 2 个私有子网(部署 Lambda 与 Aurora)。
+
+Parameters:
+  CorsOrigin:
+    Type: String
+    Default: "*"
+    Description: 浏览器跨域来源；用页面同源访问时 * 即可。
+  DBName:
+    Type: String
+    Default: appdb
+  DBUsername:
+    Type: String
+    Default: app_admin
+  BasicAuthUser:
+    Type: String
+    Default: admin
+    Description: 页面/接口 Basic Auth 用户名（密码自动生成在 AuthSecret 里）。
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Timeout: 30
+    MemorySize: 256
+    Architectures: [arm64]
+
+Resources:
+  # ──────────────────────────── 网络 ────────────────────────────
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # 公有子网：放 NAT，路由走 IGW（对外上网的那一个子网）
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public" }]
+
+  # 两个私有子网：部署 Lambda + Aurora（跨 2 个 AZ）
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-private-1" }]
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-private-2" }]
+
+  # NAT 网关（Lambda 经它出网调 api.github.com）
+  NatEip:
+    Type: AWS::EC2::EIP
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Domain: vpc
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-nat" }]
+
+  # 公有路由表：0.0.0.0/0 -> IGW
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet
+
+  # 私有路由表：0.0.0.0/0 -> NAT
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+  PrivateSubnet1Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+  PrivateSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  # ──────────────────────────── 安全组 ────────────────────────────
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda egress (NAT + Aurora)
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-lambda-sg" }]
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora, 仅允许 Lambda 访问 5432
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-db-sg" }]
+  DBIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+
+  # ──────────────────────────── 数据库凭据 ────────────────────────────
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub "${AWS::StackName} Aurora master credential"
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DBUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true # 生成纯字母数字密码，可安全放进 DATABASE_URL
+
+  # 页面/接口 Basic Auth 的密码（自动生成）。部署后用以下命令查看：
+  #   aws secretsmanager get-secret-value --secret-id <AuthSecret 的 ARN> --query SecretString
+  AuthSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub "${AWS::StackName} 页面/接口 Basic Auth 密码"
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${BasicAuthUser}"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+
+  # ──────────────────────────── Aurora Serverless v2 ────────────────────────────
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Aurora 私有子网组
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+
+  DBCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: aurora-postgresql
+      DatabaseName: !Ref DBName
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds: [!Ref DBSecurityGroup]
+      Port: 5432
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 2
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBClusterIdentifier: !Ref DBCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+
+  # ──────────────────────────── Lambda(Hono) + HTTP API ────────────────────────────
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: apps/server/dist/
+      Handler: lambda.handler
+      VpcConfig:
+        SecurityGroupIds: [!Ref LambdaSecurityGroup]
+        SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      Environment:
+        Variables:
+          NODE_ENV: production
+          CORS_ORIGIN: !Ref CorsOrigin
+          BASIC_AUTH_USER: !Ref BasicAuthUser
+          BASIC_AUTH_PASSWORD: !Sub "{{resolve:secretsmanager:${AuthSecret}:SecretString:password}}"
+          DATABASE_SSL: "true"
+          DATABASE_URL: !Sub "postgresql://${DBUsername}:{{resolve:secretsmanager:${DBSecret}:SecretString:password}}@${DBCluster.Endpoint.Address}:5432/${DBName}"
+      Events:
+        Root:
+          Type: HttpApi
+          Properties:
+            Path: /
+            Method: ANY
+        Proxy:
+          Type: HttpApi
+          Properties:
+            Path: /{proxy+}
+            Method: ANY
+
+Outputs:
+  ApiUrl:
+    Description: 访问页面/接口的地址
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  DBEndpoint:
+    Description: Aurora 写入端点
+    Value: !GetAtt DBCluster.Endpoint.Address
+  AuthSecretArn:
+    Description: 取 Basic Auth 密码 (aws secretsmanager get-secret-value --secret-id <此ARN>)
+    Value: !Ref AuthSecret

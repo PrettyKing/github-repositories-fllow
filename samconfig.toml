@@ -1,0 +1,11 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "github-repositories-fllow"
+region = "ap-northeast-1"
+resolve_s3 = true
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = false
+fail_on_empty_changeset = false
+# 把页面/接口 CORS 放开为同源(*)；如需限制改成具体域名。
+parameter_overrides = "CorsOrigin=\"*\""
