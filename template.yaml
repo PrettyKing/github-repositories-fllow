@@ -30,7 +30,8 @@ Globals:
   Function:
     Runtime: nodejs22.x
     Timeout: 30
-    MemorySize: 256
+    # 512MB：兼顾托管静态 SPA 资源与更快冷启动（CPU 随内存线性提升）。
+    MemorySize: 512
     Architectures: [arm64]
 
 Resources:

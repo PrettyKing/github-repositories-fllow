@@ -31,9 +31,10 @@ jobs:
       - name: Install deps
         run: pnpm install --frozen-lockfile
 
-      # 构建自包含的 Lambda 产物 -> apps/server/dist/lambda.mjs
-      - name: Build server bundle
-        run: pnpm --filter server build
+      # 构建 React SPA + 自包含 Lambda，并把 web 产物拷入 dist/client
+      # -> apps/server/dist/{lambda.mjs, client/}
+      - name: Build SPA + server bundle
+        run: pnpm build:lambda
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4

@@ -23,6 +23,13 @@
 4. **VPC 自带主路由表(main route table)** —— AWS 每个 VPC 自动建一张；模板显式建 public/private 两张并关联全部子网，主表空置属正常、免费、删不掉，不必处理。
 5. **`DATABASE_URL` 里的密码含标点会破坏连接串** —— Secrets Manager 生成密码时设 `ExcludePunctuation`，得到纯字母数字密码可安全拼接。
 6. **部署顺序** —— 必须先建 bootstrap 栈（权限边界）再部署主栈，否则主栈的 Lambda 执行角色因缺边界被部署角色拒绝创建。
+7. **tsdown 的 local 配置 `clean:true` 会清空 `dist/`** —— 前端静态资源必须在 `pnpm --filter server build` **之后**再拷进 `dist/client`，否则被清掉。`build:lambda` 顺序固定为：web build → server build → copy（见 `scripts/copy-web-to-server.mjs`、根脚本 `build:lambda`）。
+8b. **`github_repos` 需 `UNIQUE(user_id, repo_id)`** —— 同步采用「先删后插」，并发同账户 sync 会产生重复仓库行、撑大 stats 计数。加复合唯一约束 + insert `onConflictDoNothing` 兜底。
+8c. **SPA fallback 必须排除 `/api/*`** —— 否则未匹配的 `GET /api/xxx` 被兜底当页面返回 `index.html`(200)，前端 `res.json()` 解析 HTML 抛 SyntaxError。在 serveStatic 前加 `app.all("/api/*", → 404 json)`。
+8d. **手写 migration 的唯一约束前要先去重** —— drizzle 生成的 migration 不含数据级去重；在 `ADD CONSTRAINT UNIQUE` 前手动补 `DELETE ... USING ...`，否则含重复行的库跑 `db:migrate` 会失败回滚（与 ensureSchema 的顺序保持一致）。
+8e. **语言占比分母用「有语言的仓库数」** —— 用全部仓库数（含 language=null）作分母会让各语言占比之和 <100%，进度条视觉偏短。
+
+8. **`serveStatic({ root: "./client" })` 相对启动时 cwd** —— Lambda 内 cwd=`/var/task`，故静态目录解析为 `/var/task/client`（CodeUri 内）。本地验证 Hono 自身托管静态时须从 `apps/server/dist/` 目录启动才能命中；日常本地开发走 Vite(5173) proxy，不依赖 Hono 出静态。
 
 ## 线上验证记录（as-built）
 

@@ -2,11 +2,11 @@ import { integer, pgTable, serial, text, timestamp } from "drizzle-orm/pg-core";
 
 /**
  * 保存通过个人 token 拉取到的 GitHub 账户信息。
- * 每提交一次 token 就「增」一条记录，列表里可「删」一条记录。
+ * github_id 加唯一约束，避免重复提交同一账户产生多条脏数据（upsert 依赖此约束）。
  */
 export const githubUsers = pgTable("github_users", {
   id: serial("id").primaryKey(),
-  githubId: integer("github_id").notNull(),
+  githubId: integer("github_id").notNull().unique(),
   login: text("login").notNull(),
   name: text("name"),
   avatarUrl: text("avatar_url"),
@@ -18,6 +18,7 @@ export const githubUsers = pgTable("github_users", {
   following: integer("following").notNull().default(0),
   htmlUrl: text("html_url"),
   createdAt: timestamp("created_at").notNull().defaultNow(),
+  updatedAt: timestamp("updated_at").notNull().defaultNow(),
 });
 
 export type GithubUser = typeof githubUsers.$inferSelect;

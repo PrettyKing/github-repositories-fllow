@@ -8,6 +8,20 @@
       "when": 1782623900190,
       "tag": "0000_chief_pet_avengers",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1782662930470,
+      "tag": "0001_yielding_stranger",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1782664711364,
+      "tag": "0002_bitter_prowler",
+      "breakpoints": true
     }
   ]
 }
