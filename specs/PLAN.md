@@ -32,9 +32,9 @@
 | 序号 | feature                 | 说明                                                  | 依赖                | 状态   |
 | ---- | ----------------------- | ----------------------------------------------------- | ------------------- | ------ |
 | 5    | frontend-react-spa      | 前端 React 化：SPA 取代 page.ts，同 Lambda 托管静态   | 2                   | ✅ 完成 |
-| 6    | github-repos-collection | A：收集并展示账户仓库（github_repos 表 + 分页取数）    | 1,2,5               | ✅ 实现完成（集成测试待部署 DB） |
-| 7    | user-dedup-refresh      | B：提交去重(upsert) + 刷新同步                         | 1,2,5（refresh 接 6）| ✅ 实现完成（集成测试待部署 DB） |
-| 8    | stats-dashboard         | E：聚合统计面板（CSS 进度条，无图表库）               | 5,6,7               | ✅ 实现完成（集成测试待部署 DB） |
+| 6    | github-repos-collection | A：收集并展示账户仓库（github_repos 表 + 分页取数）    | 1,2,5               | ✅ 完成（已部署，2026-06-29） |
+| 7    | user-dedup-refresh      | B：提交去重(upsert) + 刷新同步                         | 1,2,5（refresh 接 6）| ✅ 完成（已部署，2026-06-29） |
+| 8    | stats-dashboard         | E：聚合统计面板（CSS 进度条，无图表库）               | 5,6,7               | ✅ 完成（已部署，2026-06-29） |
 
 **推荐执行顺序**：5 → 6 → 7 → 8（先 React 化打底，再叠 A/B/E；6 与 7 后端部分可并行）
 
