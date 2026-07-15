@@ -1,0 +1,40 @@
+name: Deploy Web (Cloudflare Pages)
+
+# 前端 Next.js 静态导出 → Cloudflare Pages（架构图 CI/CD 的 Web 线）。
+# 自定义域名 app.faithcal.xyz 在 Pages 项目里绑定；同源 /api 由 out/_redirects 代理到 API Gateway。
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "apps/web/**"
+      - "packages/ui/**"
+      - "pnpm-lock.yaml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build static export (out/)
+        run: pnpm --filter web build
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy apps/web/out --project-name=github-repositories-fllow-web

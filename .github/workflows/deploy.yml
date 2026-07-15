@@ -12,8 +12,11 @@ permissions:
 
 env:
   AWS_REGION: ap-northeast-1
+  ECS_STACK: github-repositories-fllow-ecs
+  ECR_REPO: github-repositories-fllow-go
 
 jobs:
+  # 主栈：Lambda 薄代理 + VPC + Aurora（前端已迁 Pages，这里只打 Lambda 产物）
   deploy:
     runs-on: ubuntu-latest
     steps:
@@ -31,9 +34,8 @@ jobs:
       - name: Install deps
         run: pnpm install --frozen-lockfile
 
-      # 构建 React SPA + 自包含 Lambda，并把 web 产物拷入 dist/client
-      # -> apps/server/dist/{lambda.mjs, client/}
-      - name: Build SPA + server bundle
+      # 打自包含 Lambda 产物 -> apps/server/dist/lambda.mjs（前端不再随 Lambda 打包）
+      - name: Build Lambda bundle
         run: pnpm build:lambda
 
       - name: Configure AWS credentials (OIDC)
@@ -51,3 +53,73 @@ jobs:
 
       - name: SAM deploy
         run: sam deploy --no-confirm-changeset --no-fail-on-empty-changeset
+
+  # 检测本次 push 是否改动了 Go 服务或其 IaC，只有变了才重部署 ECS（避免每次 push 都滚服务）
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            go:
+              - 'apps/go-api/**'
+              - 'infra/ecs-fargate.yaml'
+
+  # ECS Go 栈：构建 arm64 镜像 → 推 ECR → 部署/更新服务（唯一 DB 访问方）
+  # needs deploy：确保主栈（被 ECS 栈 ImportValue 依赖）先就绪，首次部署顺序正确
+  deploy-ecs:
+    needs: [deploy, changes]
+    if: ${{ needs.changes.outputs.go == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # 首次部署：ECR 仓库尚不存在时，先以 DesiredCount=0 建栈（建出 ECR + 网络/服务骨架，
+      # 无需镜像即可稳定），随后推镜像、再以 DesiredCount=1 滚起来。已存在则跳过。
+      - name: Bootstrap ECS stack if first run
+        run: |
+          if ! aws ecr describe-repositories --repository-names "$ECR_REPO" >/dev/null 2>&1; then
+            echo "First run: creating ECS stack at DesiredCount=0"
+            aws cloudformation deploy \
+              --template-file infra/ecs-fargate.yaml \
+              --stack-name "$ECS_STACK" \
+              --capabilities CAPABILITY_NAMED_IAM \
+              --no-fail-on-empty-changeset \
+              --parameter-overrides DesiredCount=0 ImageTag=bootstrap
+          fi
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build & push Go image (arm64)
+        run: |
+          REPO_URI=$(aws ecr describe-repositories --repository-names "$ECR_REPO" \
+            --query 'repositories[0].repositoryUri' --output text)
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${REPO_URI%%/*}"
+          docker buildx build --platform linux/arm64 \
+            -t "${REPO_URI}:${GITHUB_SHA}" --push apps/go-api
+
+      - name: Deploy ECS stack
+        run: |
+          aws cloudformation deploy \
+            --template-file infra/ecs-fargate.yaml \
+            --stack-name "$ECS_STACK" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides DesiredCount=1 ImageTag="${GITHUB_SHA}"
+
+      - name: Wait for service to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster github-repositories-fllow-cluster \
+            --services github-repositories-fllow-go-api

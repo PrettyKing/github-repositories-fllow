@@ -1,0 +1,287 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  PR preview bootstrap (admin, once). Split-privilege model:
+  - Build (untrusted PR code) runs in a low-privilege CodeBuild project with an
+    INLINE buildspec (PR cannot alter build steps) and ECR-push-only permissions.
+  - Deploy/destroy + Cloudflare DNS run in trusted GitHub Actions (from the base
+    branch) via the OpsRole; the Cloudflare secret is only reachable by OpsRole.
+  This keeps secrets and deploy permissions out of the untrusted build path.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub 用户名/组织（如 PrettyKing）。
+  GitHubRepo:
+    Type: String
+    Default: github-repositories-fllow
+  MainStackName:
+    Type: String
+    Default: github-repositories-fllow
+  DeployRegion:
+    Type: String
+    Default: ap-northeast-1
+
+Resources:
+  # ──────────────────────────── ECR（预览镜像仓库）────────────────────────────
+  PreviewEcrRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub "${MainStackName}-pr-preview"
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              { "rulePriority": 1, "description": "expire untagged after 1 day",
+                "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 1 },
+                "action": { "type": "expire" } },
+              { "rulePriority": 2, "description": "keep last 20 preview images",
+                "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 20 },
+                "action": { "type": "expire" } }
+            ]
+          }
+
+  # Cloudflare API Token（占位）：建栈后由 admin 填入。只有 OpsRole 能读，不进构建路径。
+  #   aws secretsmanager put-secret-value --secret-id <此ARN> \
+  #     --secret-string '{"apiToken":"<token>","zoneId":"<zoneId>"}'
+  CloudflareSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${MainStackName}/cloudflare"
+      Description: Cloudflare API token and zone id for PR preview DNS
+
+  # ──────────────────────────── 构建角色（最小权限，仅 ECR + 日志）────────────────────────────
+  # 构建的是不可信 PR 代码，故此角色不含任何密钥/部署权限。
+  PrPreviewBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${GitHubRepo}-pr-preview-build"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${DeployRegion}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+              - Sid: EcrPushOnly
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: "*"
+
+  # ──────────────────────────── 运行角色（预览 Fargate 任务用）────────────────────────────
+  PrPreviewRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${GitHubRepo}-pr-preview-runtime"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # ──────────────────────────── Ops 角色（GitHub Actions 经 OIDC 假设）────────────────────────────
+  # 可信的 preview-deploy/destroy 工作流（逻辑来自 base 分支）用它：启动构建 + 部署/销毁
+  # per-PR 栈 + 读 Cloudflare 密钥 + PassRole 运行角色。密钥/部署权限都集中在这里，不下放到构建。
+  PrPreviewOpsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${GitHubRepo}-pr-preview-ops"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                # pull_request_target 的 sub 可能是 :pull_request 或 base 分支 ref，两者都放行；
+                # fork PR 由工作流侧 same-repo guard 拦截（此处不细分）。
+                token.actions.githubusercontent.com:sub:
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:pull_request"
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/main"
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/master"
+      Policies:
+        - PolicyName: preview-ops
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: StartAndWaitBuild
+                Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt PrPreviewBuildProject.Arn
+              # ListStacks 不能按资源收窄，单列一条放行（reconciler 枚举预览栈用）
+              - Sid: ListStacks
+                Effect: Allow
+                Action: cloudformation:ListStacks
+                Resource: "*"
+              # 收窄到 -pr-* 栈；cloudformation:* 覆盖 CDK 的 changeset/GetTemplate 等调用
+              - Sid: DeployPerPrStacks
+                Effect: Allow
+                Action: cloudformation:*
+                Resource: !Sub "arn:aws:cloudformation:${DeployRegion}:${AWS::AccountId}:stack/${MainStackName}-pr-*/*"
+              - Sid: PerPrResources
+                Effect: Allow
+                Action:
+                  - ecs:*
+                  - elasticloadbalancing:*
+                  - ec2:Describe*
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:DescribeLogGroups
+                  - ecr:DescribeRepositories
+                  - ecr:DescribeImages
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref DeployRegion
+              - Sid: ReadCloudflareSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref CloudflareSecret
+              - Sid: PassRuntimeRoleToEcs
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt PrPreviewRuntimeRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+  # ──────────────────────────── CodeBuild：只构建镜像（内联 buildspec，PR 改不了步骤）────────────────────────────
+  PrPreviewBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${MainStackName}-pr-build"
+      Description: Build the PR Go image and push to ECR (no secrets, no deploy)
+      ServiceRole: !GetAtt PrPreviewBuildRole.Arn
+      Artifacts: { Type: NO_ARTIFACTS }
+      Source:
+        Type: GITHUB
+        Location: !Sub "https://github.com/${GitHubOrg}/${GitHubRepo}.git"
+        # 内联 buildspec（可信）：PR 只能改被构建的代码，改不了这里的构建步骤。
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - set -euo pipefail
+                - test -n "${IMAGE_TAG:-}" || { echo "IMAGE_TAG required"; exit 1; }
+                - REGISTRY="$(echo "$PREVIEW_ECR_URI" | cut -d/ -f1)"
+                - aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+            build:
+              commands:
+                - docker build --platform linux/arm64 -t "${PREVIEW_ECR_URI}:${IMAGE_TAG}" apps/go-api
+                - docker push "${PREVIEW_ECR_URI}:${IMAGE_TAG}"
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - { Name: PREVIEW_ECR_URI, Value: !GetAtt PreviewEcrRepo.RepositoryUri }
+      TimeoutInMinutes: 20
+
+  # ──────────────────────────── 共享预览入口 ALB（长期存在，被所有 PR 复用）────────────────────────────
+  # 稳定入口：任务 IP 变化被 ALB 目标组屏蔽；Host 路由 api-pr-<n> → 各 PR 目标组。
+  # HTTP:80，Cloudflare 用 DNS-only CNAME 指过来（http://api-pr-<n>.<zone>，无端口、免证书）。
+  PreviewAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Shared preview ALB - allow 80 from internet (Cloudflare)
+      VpcId: !ImportValue
+        Fn::Sub: "${MainStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub "${MainStackName}-preview-alb-sg" }]
+
+  PreviewAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${MainStackName}-preview-alb"
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups: [!Ref PreviewAlbSecurityGroup]
+      Subnets:
+        - !ImportValue
+          Fn::Sub: "${MainStackName}-PublicSubnet"
+        - !ImportValue
+          Fn::Sub: "${MainStackName}-PublicSubnet2"
+
+  # 默认 404：未匹配任何 PR host 的请求直接拒
+  PreviewAlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref PreviewAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "404"
+            ContentType: text/plain
+            MessageBody: no preview for this host
+
+Outputs:
+  OpsRoleArn:
+    Description: 填到 GitHub Secret AWS_PR_PREVIEW_OPS_ROLE_ARN（preview-deploy/destroy 假设它）
+    Value: !GetAtt PrPreviewOpsRole.Arn
+  BuildProjectName:
+    Value: !Ref PrPreviewBuildProject
+  RuntimeRoleArn:
+    Description: 预览 Fargate 任务的执行/任务角色（部署 per-PR 栈时传入）
+    Value: !GetAtt PrPreviewRuntimeRole.Arn
+  CloudflareSecretArn:
+    Description: 建栈后 put-secret-value 填入 apiToken/zoneId
+    Value: !Ref CloudflareSecret
+  PreviewEcrUri:
+    Value: !GetAtt PreviewEcrRepo.RepositoryUri
+  PreviewAlbDnsName:
+    Description: Cloudflare 把 api-pr-<n> 用 DNS-only CNAME 指向这个 ALB 域名
+    Value: !GetAtt PreviewAlb.DNSName
+  PreviewAlbListenerArn:
+    Value: !Ref PreviewAlbListener
+    Export: { Name: !Sub "${MainStackName}-PreviewAlbListenerArn" }
+  PreviewAlbSecurityGroupId:
+    Value: !Ref PreviewAlbSecurityGroup
+    Export: { Name: !Sub "${MainStackName}-PreviewAlbSecurityGroup" }

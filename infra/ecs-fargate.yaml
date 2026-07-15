@@ -1,0 +1,337 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Task 2: Go API on ECS Fargate behind an ALB, with the Hono Lambda linked as a
+  second ALB target group and internal service discovery via AWS Cloud Map.
+  This stack imports the VPC/subnets/DB from the main stack (template.yaml) and
+  does not recreate any network or database resource.
+
+Parameters:
+  MainStackName:
+    Type: String
+    Default: github-repositories-fllow
+    Description: 主栈名，用于 Fn::ImportValue 引用其 VPC/子网/数据库/Lambda 导出。
+  ImageTag:
+    Type: String
+    Default: bootstrap
+    Description: 要运行的 go-api 镜像 tag（CI/CodeBuild 推镜像后传入 commit SHA）。
+  DesiredCount:
+    Type: Number
+    Default: 1
+    Description: 首次部署（ECR 尚无镜像）时先设 0，推镜像后再设 1，避免服务无法稳定导致回滚。
+  BasicAuthUser:
+    Type: String
+    Default: admin
+    Description: 与主栈一致的 Basic Auth 用户名（密码从主栈 AuthSecret 注入）。
+
+Conditions:
+  HasDesiredCount: !Not [!Equals [!Ref DesiredCount, 0]]
+
+Resources:
+  # ──────────────────────────── ECR ────────────────────────────
+  EcrRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub "${MainStackName}-go-api"
+      EmptyOnDelete: true # 拆栈时连同镜像一起删，验收后不留仓库
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        # 只保留最近 10 个镜像，untagged 1 天后过期，控制存储成本
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "expire untagged images after 1 day",
+                "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 1 },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "keep last 10 images",
+                "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 10 },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # ──────────────────────────── 日志 ────────────────────────────
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/ecs/${MainStackName}-go-api"
+      RetentionInDays: 14
+
+  # ──────────────────────────── Cloud Map（服务发现）────────────────────────────
+  # 私有 DNS 命名空间：Fargate 任务自动注册 go-api.<stack>.internal（A 记录）。
+  # 同 VPC 内的 Hono Lambda 由此按内网 DNS 直连 Go 服务（无需公网/ALB 回环），
+  # 反向 Go 服务也可用它做服务间发现 —— 这就是「用 CloudMap 链接接口」的内部链路。
+  CloudMapNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub "${MainStackName}.internal"
+      Vpc: !ImportValue
+        Fn::Sub: "${MainStackName}-VpcId"
+
+  CloudMapService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: go-api
+      NamespaceId: !GetAtt CloudMapNamespace.Id
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 15
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  # ──────────────────────────── 安全组 ────────────────────────────
+  # 内网测试 ALB 的 SG：仅放行 VPC 内 80（不对公网开放）
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internal test ALB - allow 80 from within VPC only
+      VpcId: !ImportValue
+        Fn::Sub: "${MainStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 10.0.0.0/16
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub "${MainStackName}-alb-sg" }]
+
+  EcsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fargate task - allow 8080 from Lambda and test ALB
+      VpcId: !ImportValue
+        Fn::Sub: "${MainStackName}-VpcId"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub "${MainStackName}-ecs-sg" }]
+  # 生产路径：Lambda 薄代理经 Cloud Map 内网 DNS 直连 Go 服务
+  EcsIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !ImportValue
+        Fn::Sub: "${MainStackName}-LambdaSecurityGroup"
+  # 测试路径：内网 ALB 直接打 Go（仅调试用）
+  EcsIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref EcsSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+
+  # 让 Fargate 任务能连主栈的 Aurora（主栈 DB SG 原本只放行 Lambda SG）
+  DbIngressFromEcs:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !ImportValue
+        Fn::Sub: "${MainStackName}-DBSecurityGroup"
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref EcsSecurityGroup
+
+  # ──────────────────────────── ALB（仅测试，非生产入口）────────────────────────────
+  # 生产入口是 API Gateway→Lambda→Cloud Map→Go；这个内网 ALB 只供在 VPC 内直连
+  # 调试 Go 服务（对照架构图「ALB→ECS 仅测试」）。故 Scheme=internal、放私有子网。
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${MainStackName}-alb-test"
+      Type: application
+      Scheme: internal
+      SecurityGroups: [!Ref AlbSecurityGroup]
+      Subnets:
+        - !ImportValue
+          Fn::Sub: "${MainStackName}-PrivateSubnet1"
+        - !ImportValue
+          Fn::Sub: "${MainStackName}-PrivateSubnet2"
+
+  # Go 服务目标组（IP 目标，Fargate awsvpc）
+  EcsTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${MainStackName}-go-tg"
+      VpcId: !ImportValue
+        Fn::Sub: "${MainStackName}-VpcId"
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Matcher: { HttpCode: "200" }
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref EcsTargetGroup
+
+  # ──────────────────────────── IAM（挂权限边界，与主栈防提权模型一致）────────────────────────────
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${MainStackName}-ecs-exec"
+      PermissionsBoundary: !Sub "arn:aws:iam::${AWS::AccountId}:policy/${MainStackName}-ecs-boundary"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # 拉取容器时注入 Basic Auth 密码（DB 密码经 DATABASE_URL 组装，见任务定义）
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !ImportValue
+                    Fn::Sub: "${MainStackName}-AuthSecretArn"
+                  - !ImportValue
+                    Fn::Sub: "${MainStackName}-DBSecretArn"
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${MainStackName}-ecs-task"
+      PermissionsBoundary: !Sub "arn:aws:iam::${AWS::AccountId}:policy/${MainStackName}-ecs-boundary"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+
+  # ──────────────────────────── ECS ────────────────────────────
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${MainStackName}-cluster"
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${MainStackName}-go-api"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: go-api
+          Image: !Sub "${EcrRepo.RepositoryUri}:${ImageTag}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Environment:
+            - Name: PORT
+              Value: "8080"
+            - Name: BASIC_AUTH_USER
+              Value: !Ref BasicAuthUser
+            # DATABASE_URL 含密码：与主栈 Lambda 同法，用 resolve 在部署期组装内网连接串
+            - Name: DATABASE_URL
+              Value: !Sub
+                - "postgresql://${User}:{{resolve:secretsmanager:${DBSecretArn}:SecretString:password}}@${DBHost}:5432/${DBName}?sslmode=require"
+                - User: !ImportValue
+                    Fn::Sub: "${MainStackName}-DBUsername"
+                  DBSecretArn: !ImportValue
+                    Fn::Sub: "${MainStackName}-DBSecretArn"
+                  DBHost: !ImportValue
+                    Fn::Sub: "${MainStackName}-DBClusterEndpoint"
+                  DBName: !ImportValue
+                    Fn::Sub: "${MainStackName}-DBName"
+          Secrets:
+            # Basic Auth 密码用 ECS secrets 注入（不落任务定义明文），取 JSON 的 password 字段
+            - Name: BASIC_AUTH_PASSWORD
+              ValueFrom: !Sub
+                - "${AuthSecretArn}:password::"
+                - AuthSecretArn: !ImportValue
+                    Fn::Sub: "${MainStackName}-AuthSecretArn"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: go-api
+
+  Service:
+    Type: AWS::ECS::Service
+    # 必须等监听器就绪才能把服务挂到目标组
+    DependsOn: Listener
+    Properties:
+      ServiceName: !Sub "${MainStackName}-go-api"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # 私有子网 + 经主栈 NAT 出网拉 ECR 镜像与调 GitHub；不分配公网 IP
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue
+              Fn::Sub: "${MainStackName}-PrivateSubnet1"
+            - !ImportValue
+              Fn::Sub: "${MainStackName}-PrivateSubnet2"
+          SecurityGroups: [!Ref EcsSecurityGroup]
+      LoadBalancers:
+        - TargetGroupArn: !Ref EcsTargetGroup
+          ContainerName: go-api
+          ContainerPort: 8080
+      ServiceRegistries:
+        - RegistryArn: !GetAtt CloudMapService.Arn
+
+Outputs:
+  AlbTestUrl:
+    Description: 内网测试 ALB（仅 VPC 内直连 Go 调试；生产入口是 API Gateway→Lambda→Cloud Map→Go）
+    Value: !Sub "http://${Alb.DNSName}"
+  EcrRepositoryUri:
+    Description: 推镜像的目标（docker push <此值>:<tag>）
+    Value: !GetAtt EcrRepo.RepositoryUri
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !Sub "${MainStackName}-go-api"
+  CloudMapServiceDns:
+    Description: Go 服务的内网发现名（Hono Lambda 可直连）
+    Value: !Sub "go-api.${MainStackName}.internal"
+  DesiredCountEcho:
+    Value: !If [HasDesiredCount, "running", "scaled-to-zero"]

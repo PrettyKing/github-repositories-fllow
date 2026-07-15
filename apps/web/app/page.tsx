@@ -1,3 +1,5 @@
+"use client";
+
 import { Button } from "@github-repositories-fllow/ui/components/button";
 import {
   Card,
@@ -18,6 +20,7 @@ import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import StatsPanel from "@/components/stats-panel";
+import ProfileCard from "@/components/profile-card";
 import type { GithubRepo, GithubUser, Stats } from "@/lib/api";
 import {
   addUser,
@@ -27,8 +30,6 @@ import {
   listUsers,
   refreshUser,
 } from "@/lib/api";
-
-import type { Route } from "./+types/_index";
 
 /** 仓库加载状态（按需展开加载，存 Map 中避免重复请求） */
 type RepoState =
@@ -113,13 +114,6 @@ function renderRepoContent(state: RepoState | undefined): React.ReactNode {
       ))}
     </ul>
   );
-}
-
-export function meta({}: Route.MetaArgs) {
-  return [
-    { title: "GitHub 账户信息收集" },
-    { name: "description", content: "GitHub 账户收集与管理" },
-  ];
 }
 
 export default function Home() {
@@ -276,6 +270,8 @@ export default function Home() {
   return (
     <div className="container mx-auto max-w-3xl px-4 py-6">
       <h1 className="mb-6 text-xl font-semibold">GitHub 账户信息收集</h1>
+
+      <ProfileCard />
 
       {/* 统计区：首屏加载及增删刷新后自动更新 */}
       <StatsPanel stats={stats} loading={loading} />

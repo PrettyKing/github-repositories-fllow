@@ -1,0 +1,94 @@
+name: PR Preview Destroy
+
+# PR 关闭（含 merged）时销毁该 PR 的预览环境。逻辑来自 base 分支（可信）。
+on:
+  pull_request_target:
+    types: [closed]
+
+# 与 deploy 同一并发组串行，避免删/建交错
+concurrency:
+  group: preview-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: ap-northeast-1
+  MAIN_STACK: github-repositories-fllow
+  BOOTSTRAP_STACK: github-repositories-fllow-pr-preview
+  CF_ZONE: faithcal.xyz
+
+jobs:
+  destroy:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    env:
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PR_PREVIEW_OPS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Destroy per-PR stack (CDK, fail on DELETE_FAILED)
+        working-directory: infra/cdk
+        run: |
+          set -euo pipefail
+          STACK="${MAIN_STACK}-pr-${PR}"
+          if ! aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; then
+            echo "栈 $STACK 不存在 —— 幂等成功"; exit 0
+          fi
+          npm install --no-audit --no-fund
+          # cdk destroy 用同样的 PR 参数合成同名栈并请求删除；失败会非零退出（不吞 DELETE_FAILED）
+          npx cdk destroy "$STACK" --force \
+            -c mainStackName="$MAIN_STACK" -c prNumber="$PR" -c previewZone="$CF_ZONE"
+          # 复核确实删掉
+          if aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; then
+            st=$(aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text)
+            echo "::error::栈仍存在，状态=$st，需人工介入"; exit 1
+          fi
+          echo "已删除"
+
+      - name: Read Cloudflare secret + delete DNS
+        run: |
+          set -euo pipefail
+          CF_SECRET_ARN=$(aws cloudformation describe-stacks --stack-name "$BOOTSTRAP_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='CloudflareSecretArn'].OutputValue" --output text)
+          CF_JSON=$(aws secretsmanager get-secret-value --secret-id "$CF_SECRET_ARN" --query SecretString --output text)
+          CF_API_TOKEN=$(echo "$CF_JSON" | jq -r .apiToken)
+          CF_ZONE_ID=$(echo "$CF_JSON" | jq -r .zoneId)
+          NAME="api-pr-${PR}.${CF_ZONE}"
+          API="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records"
+          REC=$(curl -fsS -H "Authorization: Bearer ${CF_API_TOKEN}" "${API}?type=CNAME&name=${NAME}" | jq -r '.result[0].id // empty')
+          if [ -n "$REC" ]; then
+            curl -fsS -X DELETE -H "Authorization: Bearer ${CF_API_TOKEN}" "${API}/${REC}" >/dev/null
+            echo "DNS ${NAME} 已删除"
+          else
+            echo "无 DNS 记录（ok）"
+          fi
+
+      - name: Update PR comment -> removed
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = Number(process.env.PR);
+            const anchor = '<!-- pr-preview-environment -->';
+            const body = `${anchor}\n### 🧹 PR 预览已移除\n\n环境与 DNS 已随 PR 关闭清理，无残留资源。`;
+            const { owner, repo } = context.repo;
+            const list = await github.rest.issues.listComments({ owner, repo, issue_number: pr });
+            const existing = list.data.find(c => c.body && c.body.includes(anchor));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: pr, body });
+            }

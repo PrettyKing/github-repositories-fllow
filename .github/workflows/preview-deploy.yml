@@ -1,0 +1,148 @@
+name: PR Preview Deploy
+
+# pull_request_target：工作流定义来自 base 分支（可信），有 secrets/OIDC。
+# 安全边界：只 checkout base 的模板/脚本（可信），PR 代码仅作为 CodeBuild 的构建输入；
+# fork PR 由 same-repo guard 跳过（不给部署权限）。
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+# 同一 PR 的 deploy 与 destroy 串行，避免「关闭后又被部署」竞态（§并发）
+concurrency:
+  group: preview-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  deployments: write
+
+env:
+  AWS_REGION: ap-northeast-1
+  MAIN_STACK: github-repositories-fllow
+  BOOTSTRAP_STACK: github-repositories-fllow-pr-preview
+  CF_ZONE: faithcal.xyz
+
+jobs:
+  deploy:
+    # fork PR 不建预览（pull_request_target 会带 secrets，必须挡住不可信来源）
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    environment:
+      name: preview-pr-${{ github.event.pull_request.number }}
+      url: http://api-pr-${{ github.event.pull_request.number }}.faithcal.xyz
+    env:
+      PR: ${{ github.event.pull_request.number }}
+      SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      # 只取 base 分支的可信内容（CDK app infra/cdk、脚本 scripts/*）
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Guard - PR 仍为 open
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          state=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state -q .state)
+          echo "PR #$PR state=$state"
+          [ "$state" = "OPEN" ] || { echo "PR 已非 open，跳过部署"; exit 1; }
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PR_PREVIEW_OPS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Read bootstrap outputs
+        run: |
+          set -euo pipefail
+          get() { aws cloudformation describe-stacks --stack-name "$BOOTSTRAP_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text; }
+          {
+            echo "ECR_URI=$(get PreviewEcrUri)"
+            echo "RUNTIME_ROLE_ARN=$(get RuntimeRoleArn)"
+            echo "BUILD_PROJECT=$(get BuildProjectName)"
+            echo "CF_SECRET_ARN=$(get CloudflareSecretArn)"
+            echo "ALB_DNS=$(get PreviewAlbDnsName)"
+          } >> "$GITHUB_ENV"
+
+      - name: Build image via CodeBuild (PR code, low-priv)
+        run: |
+          set -euo pipefail
+          TAG="pr-${PR}-${SHA}"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+          BID=$(aws codebuild start-build --project-name "$BUILD_PROJECT" \
+            --source-version "$SHA" \
+            --environment-variables-override "name=IMAGE_TAG,value=${TAG},type=PLAINTEXT" \
+            --query 'build.id' --output text)
+          echo "Started CodeBuild $BID"
+          while true; do
+            s=$(aws codebuild batch-get-builds --ids "$BID" --query 'builds[0].buildStatus' --output text)
+            case "$s" in
+              SUCCEEDED) echo "build ok"; break ;;
+              IN_PROGRESS) sleep 15 ;;
+              *) echo "CodeBuild $s"; exit 1 ;;
+            esac
+          done
+
+      # 用 CDK 部署每 PR 栈（CliCredentialsStackSynthesizer：用 Ops 角色直接部署，免 bootstrap）
+      - name: Deploy per-PR stack (CDK)
+        working-directory: infra/cdk
+        run: |
+          set -euo pipefail
+          EXPIRES=$(date -u -d '+7 days' +%Y-%m-%dT%H:%M:%SZ)
+          npm install --no-audit --no-fund
+          npx cdk deploy "${MAIN_STACK}-pr-${PR}" --require-approval never \
+            -c mainStackName="$MAIN_STACK" -c prNumber="$PR" \
+            -c imageUri="${ECR_URI}:${TAG}" -c runtimeRoleArn="$RUNTIME_ROLE_ARN" \
+            -c previewZone="$CF_ZONE" \
+            --tags Environment=preview --tags Repository="$GITHUB_REPOSITORY" \
+            --tags PullRequest="$PR" --tags CommitSha="$SHA" --tags ExpiresAt="$EXPIRES"
+
+      - name: Wait for service stable
+        run: |
+          aws ecs wait services-stable \
+            --cluster "${MAIN_STACK}-pr-${PR}" --services "${MAIN_STACK}-pr-${PR}"
+
+      - name: Upsert Cloudflare DNS (CNAME -> 共享 ALB, DNS-only)
+        run: |
+          set -euo pipefail
+          CF_JSON=$(aws secretsmanager get-secret-value --secret-id "$CF_SECRET_ARN" --query SecretString --output text)
+          export CF_API_TOKEN=$(echo "$CF_JSON" | jq -r .apiToken)
+          export CF_ZONE_ID=$(echo "$CF_JSON" | jq -r .zoneId)
+          bash scripts/cloudflare-upsert-dns.sh CNAME "api-pr-${PR}.${CF_ZONE}" "$ALB_DNS" false
+
+      - name: Health check via preview URL
+        run: |
+          set -euo pipefail
+          URL="http://api-pr-${PR}.${CF_ZONE}/health"
+          echo "健康检查 $URL"
+          for i in $(seq 1 30); do
+            if curl -fsS -m 5 "$URL" >/dev/null; then echo "healthy"; exit 0; fi
+            sleep 6
+          done
+          echo "健康检查超时（DNS 传播/目标健康未就绪）"; exit 1
+
+      - name: Publish summary + PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = Number(process.env.PR);
+            const url = `http://api-pr-${pr}.faithcal.xyz`;
+            const sha = process.env.SHA;
+            const anchor = '<!-- pr-preview-environment -->';
+            const body = `${anchor}\n### ✅ PR 预览已部署\n\n| 组件 | 地址 |\n| --- | --- |\n| API | ${url} |\n| 健康 | ${url}/health |\n\nCommit: \`${sha}\``;
+            core.summary.addRaw(body).write();
+            const { owner, repo } = context.repo;
+            const list = await github.rest.issues.listComments({ owner, repo, issue_number: pr });
+            const existing = list.data.find(c => c.body && c.body.includes(anchor));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number: pr, body });
+            }

@@ -31,6 +31,23 @@
 
 8. **`serveStatic({ root: "./client" })` 相对启动时 cwd** —— Lambda 内 cwd=`/var/task`，故静态目录解析为 `/var/task/client`（CodeUri 内）。本地验证 Hono 自身托管静态时须从 `apps/server/dist/` 目录启动才能命中；日常本地开发走 Vite(5173) proxy，不依赖 Hono 出静态。
 
+### Go 服务上 ECS / PR 预览（作业二）
+
+9. **Go 迁移「一部分」不能只搬读路径** —— Vite 把 `POST /api/github` 抢路由到 Go 后，Go 的 sync 必须与 Node 完全等价（同步仓库 + 返回 `created/reposCount/truncated` + 201/200），否则前端加账户后仓库列表/统计静默为空。迁移接口要么整条对齐、要么别抢路由。
+10. **ALB 是多 AZ 资源** —— 主栈原本只有 1 个公有子网，ALB 至少要横跨 2 个 AZ 的公有子网；为此在 `template.yaml` 补了 `PublicSubnet2`（10.0.3.0/24, AZ-c）。
+11. **ECS 首次部署的先有鸡问题** —— ECR 尚无镜像时创建 `DesiredCount>0` 的服务会因无法稳定而回滚。先 `DesiredCount=0` 建栈 → 推镜像 → 再置 1。
+12. **ECS 角色需独立权限边界** —— 复用 Lambda 边界会因缺 `ecr:*`/`secretsmanager:GetSecretValue` 让任务执行角色失效。新增 `${stack}-ecs-boundary`，并放开部署角色「挂 Lambda 或 ECS 边界之一 + PassRole 给 ecs-tasks」。
+13. **ALB → Lambda 目标组** —— `hono/aws-lambda` 的 `handle()` 会自动识别 ALB 事件（`requestContext.elb`），故同一个 Hono Lambda 可同时被 API Gateway 与 ALB 触发；注册 Lambda 目标前必须先建 `AWS::Lambda::Permission`（principal `elasticloadbalancing.amazonaws.com`），用 `DependsOn` 排序，permission 不设 `SourceArn` 以免与目标组循环依赖。
+14. **PR 预览用 Postgres 边车做隔离** —— 每个 PR 的 Fargate 任务内跑一次性 `postgres:16-alpine`（`@localhost:5432`），随任务生死，避免预览代码碰生产 Aurora；`go-api` 容器用 `DependsOn: {postgres, HEALTHY}` 等库就绪再冷启动建表。
+15. **CloudMap 私有 DNS 不支持 CNAME** —— CNAME 记录只在公有命名空间可用；私有命名空间只能 A/AAAA/SRV。要让内网按名发现 Lambda 只能走 HTTP 命名空间 + DiscoverInstances，或改用 ALB 目标组挂 Lambda。
+
+### 数据流倒置 + Next.js + OpenRouter（对齐架构图）
+
+16. **职责倒置：Lambda 薄代理、Go 唯一连库** —— 为贴合架构图，把 Hono Lambda 改成只做「Basic Auth 校验 + 转发 + OpenRouter」，DATABASE_URL 从 Lambda 移除、安全组删掉 Lambda→RDS 入站（网络层坐实「Lambda 不连库」）。Lambda 经 `GO_API_URL`(Cloud Map 内网 DNS `go-api.<stack>.internal:8080`) 转发；建表由 Go 冷启动 `ensureSchema` 负责。ALB 从生产入口降级为 `Scheme:internal` 的仅测试资源。
+17. **Lambda 代理实现** —— `app.all("/api/*")` 用 `fetch` 转发；请求体用 `await c.req.arrayBuffer()` 缓冲再发（跨 API Gateway/ALB 适配器比透传 `ReadableStream`+`duplex:"half"` 稳，反正体积都小）；透传 `Authorization` 头让 Go 二次校验，去掉 `host`/`content-length` 头。
+18. **OpenRouter 带模板兜底** —— `generateBio` 无 `OPENROUTER_API_KEY`（或非 2xx/异常）时回退到原模板串；SAM 里 secret 占位 `{"apiKey":""}`，`emptyStringAsUndefined` 让空串视为未配置，直接走模板（不发无谓请求）。填真 key 后需重部署（resolve 是部署期解析）。
+19. **Next.js 迁移三个坑** ——（a）pnpm 11.9 起 `package.json` 的 `pnpm.onlyBuiltDependencies` 不再读，构建脚本白名单要写在 `pnpm-workspace.yaml` 的 `allowBuilds:`（`sharp: true`，Next 依赖它），否则 `pnpm run` 前的 deps 检查直接失败；（b）`output:"export"` 下 tsc 对 `import "./globals.css"` 报「找不到副作用模块声明」，加一行 `declare module "*.css";`；（c）`react-router` 的 `NavLink` → `next/link` 的 `Link` + `usePathname`。共享 `packages/ui` 需在 `next.config` 里 `transpilePackages`。
+
 ## 线上验证记录（as-built）
 
 - 线上地址：`https://e7qrl1cohh.execute-api.ap-northeast-1.amazonaws.com`
