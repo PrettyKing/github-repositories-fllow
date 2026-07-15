@@ -189,6 +189,9 @@ Resources:
                   - logs:DeleteLogGroup
                   - logs:PutRetentionPolicy
                   - logs:DescribeLogGroups
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - logs:ListTagsForResource
                   - ecr:DescribeRepositories
                   - ecr:DescribeImages
                 Resource: "*"
