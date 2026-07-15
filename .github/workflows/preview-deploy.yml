@@ -36,12 +36,21 @@ jobs:
       PR: ${{ github.event.pull_request.number }}
       SHA: ${{ github.event.pull_request.head.sha }}
     steps:
-      # 只取 base 分支的可信内容（CDK app infra/cdk、脚本 scripts/*）
+      # base 分支的可信内容（CDK app infra/cdk、脚本 scripts/*）
       - uses: actions/checkout@v4
+
+      # PR 代码单独 checkout 到 _pr/，仅作镜像构建上下文（同仓 PR，fork 已被 same-repo guard 挡）
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: _pr
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       - name: Guard - PR 仍为 open
         env:
@@ -71,24 +80,14 @@ jobs:
             echo "ALB_DNS=$(get PreviewAlbDnsName)"
           } >> "$GITHUB_ENV"
 
-      - name: Build image via CodeBuild (PR code, low-priv)
+      # 账号 CodeBuild 配额为 0，改在 Actions 里直接 buildx 打 arm64 镜像推 ECR
+      - name: Build & push image (arm64, PR code)
         run: |
           set -euo pipefail
           TAG="pr-${PR}-${SHA}"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
-          BID=$(aws codebuild start-build --project-name "$BUILD_PROJECT" \
-            --source-version "$SHA" \
-            --environment-variables-override "name=IMAGE_TAG,value=${TAG},type=PLAINTEXT" \
-            --query 'build.id' --output text)
-          echo "Started CodeBuild $BID"
-          while true; do
-            s=$(aws codebuild batch-get-builds --ids "$BID" --query 'builds[0].buildStatus' --output text)
-            case "$s" in
-              SUCCEEDED) echo "build ok"; break ;;
-              IN_PROGRESS) sleep 15 ;;
-              *) echo "CodeBuild $s"; exit 1 ;;
-            esac
-          done
+          aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_URI%%/*}"
+          docker buildx build --platform linux/arm64 -t "${ECR_URI}:${TAG}" --push _pr/apps/go-api
 
       # 用 CDK 部署每 PR 栈（CliCredentialsStackSynthesizer：用 Ops 角色直接部署，免 bootstrap）
       - name: Deploy per-PR stack (CDK)
