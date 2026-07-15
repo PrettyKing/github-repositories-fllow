@@ -238,7 +238,7 @@ Resources:
   PreviewAlb:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: !Sub "${MainStackName}-preview-alb"
+      # 不显式命名（32 字符上限）；CFN 自动生成合规名
       Type: application
       Scheme: internet-facing
       SecurityGroups: [!Ref PreviewAlbSecurityGroup]

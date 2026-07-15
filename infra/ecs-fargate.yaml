@@ -155,7 +155,7 @@ Resources:
   Alb:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: !Sub "${MainStackName}-alb-test"
+      # 不显式命名（栈名较长，ALB 名有 32 字符上限）；CFN 自动生成合规名
       Type: application
       Scheme: internal
       SecurityGroups: [!Ref AlbSecurityGroup]
