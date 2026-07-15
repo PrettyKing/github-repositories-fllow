@@ -119,9 +119,10 @@ Resources:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
               StringLike:
-                # pull_request_target 的 sub 可能是 :pull_request 或 base 分支 ref，两者都放行；
-                # fork PR 由工作流侧 same-repo guard 拦截（此处不细分）。
+                # deploy job 指定了 environment，OIDC sub 会变成 :environment:preview-pr-<n>；
+                # 同时保留 :pull_request 与 base 分支 ref。fork PR 由工作流 same-repo guard 拦截。
                 token.actions.githubusercontent.com:sub:
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:environment:preview-pr-*"
                   - !Sub "repo:${GitHubOrg}/${GitHubRepo}:pull_request"
                   - !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/main"
                   - !Sub "repo:${GitHubOrg}/${GitHubRepo}:ref:refs/heads/master"
