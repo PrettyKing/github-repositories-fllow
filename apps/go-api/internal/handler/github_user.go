@@ -51,13 +51,13 @@ func (h *GitHubUserHandler) Sync(w http.ResponseWriter, r *http.Request) {
 
 	githubUser, err := h.github.FetchCurrentUser(r.Context(), token)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
 	repos, truncated, err := h.github.FetchRepos(r.Context(), token)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
@@ -88,7 +88,7 @@ func (h *GitHubUserHandler) Profile(w http.ResponseWriter, r *http.Request) {
 
 	user, err := h.github.FetchUser(r.Context(), username)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
@@ -172,7 +172,7 @@ func (h *GitHubUserHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 
 	githubUser, err := h.github.FetchCurrentUser(r.Context(), token)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 	// 校验 token 对应账户与目标记录一致，防止用别的 token 错刷
@@ -183,7 +183,7 @@ func (h *GitHubUserHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 
 	repos, truncated, err := h.github.FetchRepos(r.Context(), token)
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
