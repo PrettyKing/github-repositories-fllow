@@ -13,7 +13,7 @@ permissions:
 env:
   AWS_REGION: ap-northeast-1
   ECS_STACK: github-repositories-fllow-ecs
-  ECR_REPO: github-repositories-fllow-go
+  ECR_REPO: github-repositories-fllow-go-api
 
 jobs:
   # 主栈：Lambda 薄代理 + VPC + Aurora（前端已迁 Pages，这里只打 Lambda 产物）
@@ -69,6 +69,7 @@ jobs:
               - 'apps/go-api/**'
               - 'infra/ecs-fargate.yaml'
               - 'infra/github-oidc.yaml'
+              - '.github/workflows/deploy.yml'
 
   # ECS Go 栈：构建 arm64 镜像 → 推 ECR → 部署/更新服务（唯一 DB 访问方）
   # needs deploy：确保主栈（被 ECS 栈 ImportValue 依赖）先就绪，首次部署顺序正确
