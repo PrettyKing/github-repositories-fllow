@@ -26,5 +26,10 @@
 
 ## CI 工作流
 
-- `.github/workflows/deploy.yml`：`permissions: id-token: write`；步骤 install(`--frozen-lockfile`) → `pnpm --filter server build` → OIDC 假设角色 → `sam validate --lint` → `sam deploy`。
+- `.github/workflows/deploy.yml`（`permissions: id-token: write`）三个 job：
+  - `deploy`：install → `pnpm build:lambda`(仅 server) → OIDC → `sam validate --lint` → `sam deploy`（主栈 Lambda）。
+  - `changes`：`dorny/paths-filter` 检测 `apps/go-api/**`、`infra/ecs-fargate.yaml` 是否变更。
+  - `deploy-ecs`（`needs: [deploy, changes]`，仅 Go/模板变更时跑）：首跑先 `DesiredCount=0` 建 ECR → `docker buildx` 打 arm64 推镜像(tag=commit SHA) → `cloudformation deploy` ECS 栈 → `ecs wait services-stable`。
+- `.github/workflows/deploy-web.yml`：`next build`(静态导出) → `wrangler pages deploy apps/web/out`（需 `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID`）。
 - 取 Basic Auth 密码：`aws secretsmanager get-secret-value --region ap-northeast-1 --secret-id <AuthSecretArn> --query SecretString --output text`。
+- ECS 栈的 IAM 角色挂 `${StackName}-ecs-boundary`（由 `infra/github-oidc.yaml` bootstrap 建）；改 Go 服务的部署角色权限须同步该栈。
