@@ -19,6 +19,20 @@ Parameters:
     Type: String
     Default: admin
     Description: 页面/接口 Basic Auth 用户名（密码自动生成在 AuthSecret 里）。
+  OpenRouterModel:
+    Type: String
+    Default: openai/gpt-4o-mini
+    Description: Lambda 调 OpenRouter 生成 bio 用的模型；密钥填在 OpenRouterSecret 里。
+  ApiDomainName:
+    Type: String
+    Default: ""
+    Description: API 自定义域名（如 api.faithcal.xyz）；留空则不启用自定义域名。
+  ApiCertificateArn:
+    Type: String
+    Default: ""
+    Description: >
+      本区域(ap-northeast-1)已签发的 ACM 证书 ARN（覆盖 ApiDomainName）。
+      与 ApiDomainName 同时提供才启用自定义域名——证书预先建好可避免建栈时等 DNS 校验卡住。
   LambdaBoundaryName:
     Type: String
     Default: github-repositories-fllow-lambda-boundary
@@ -33,6 +47,12 @@ Globals:
     # 512MB：兼顾托管静态 SPA 资源与更快冷启动（CPU 随内存线性提升）。
     MemorySize: 512
     Architectures: [arm64]
+
+Conditions:
+  # 同时提供域名与证书 ARN 才启用 API 自定义域名
+  HasCustomDomain: !And
+    - !Not [!Equals [!Ref ApiDomainName, ""]]
+    - !Not [!Equals [!Ref ApiCertificateArn, ""]]
 
 Resources:
   # ──────────────────────────── 网络 ────────────────────────────
@@ -142,20 +162,14 @@ Resources:
           CidrIp: 0.0.0.0/0
       Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-lambda-sg" }]
 
+  # Aurora 只允许来自 ECS Go 服务的 5432（入站规则在 infra/ecs-fargate.yaml 里按 ECS SG 添加）。
+  # Lambda 是薄代理、不直连 RDS，故此处不再放行 Lambda SG（网络层坐实「Lambda 不连库」）。
   DBSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Aurora SG - allow 5432 from Lambda only
+      GroupDescription: Aurora SG - allow 5432 from ECS Go service only
       VpcId: !Ref Vpc
       Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-db-sg" }]
-  DBIngressFromLambda:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref DBSecurityGroup
-      IpProtocol: tcp
-      FromPort: 5432
-      ToPort: 5432
-      SourceSecurityGroupId: !Ref LambdaSecurityGroup
 
   # ──────────────────────────── 数据库凭据 ────────────────────────────
   DBSecret:
@@ -179,6 +193,15 @@ Resources:
         GenerateStringKey: password
         PasswordLength: 24
         ExcludePunctuation: true
+
+  # OpenRouter API key（占位空串）。建栈后用真实 key 覆盖再重部署即可启用 LLM 生成 bio：
+  #   aws secretsmanager put-secret-value --secret-id <此ARN> --secret-string '{"apiKey":"<key>"}'
+  # 未设置时 apiKey 为空串，Lambda 自动回退到模板文案。
+  OpenRouterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: !Sub "${AWS::StackName} OpenRouter API key for bio generation"
+      SecretString: '{"apiKey":""}'
 
   # ──────────────────────────── Aurora Serverless v2 ────────────────────────────
   DBSubnetGroup:
@@ -230,8 +253,11 @@ Resources:
           CORS_ORIGIN: !Ref CorsOrigin
           BASIC_AUTH_USER: !Ref BasicAuthUser
           BASIC_AUTH_PASSWORD: !Sub "{{resolve:secretsmanager:${AuthSecret}:SecretString:password}}"
-          DATABASE_SSL: "true"
-          DATABASE_URL: !Sub "postgresql://${DBUsername}:{{resolve:secretsmanager:${DBSecret}:SecretString:password}}@${DBCluster.Endpoint.Address}:5432/${DBName}"
+          # 薄代理：/api/* 转发到 Cloud Map 内网 DNS 上的 Go 服务；Lambda 不含 DATABASE_URL。
+          GO_API_URL: !Sub "http://go-api.${AWS::StackName}.internal:8080"
+          # bio 生成：置真实 key 后（put-secret-value + 重部署）走 OpenRouter，否则回退模板。
+          OPENROUTER_API_KEY: !Sub "{{resolve:secretsmanager:${OpenRouterSecret}:SecretString:apiKey}}"
+          OPENROUTER_MODEL: !Ref OpenRouterModel
       Events:
         Root:
           Type: HttpApi
@@ -244,13 +270,78 @@ Resources:
             Path: /{proxy+}
             Method: ANY
 
+  # ─── API 自定义域名（可选，Cloudflare 侧再把 api.faithcal.xyz CNAME 到下方 target）───
+  ApiDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: HasCustomDomain
+    Properties:
+      DomainName: !Ref ApiDomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref ApiCertificateArn
+          EndpointType: REGIONAL
+          SecurityPolicy: TLS_1_2
+  ApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: HasCustomDomain
+    Properties:
+      ApiId: !Ref ServerlessHttpApi
+      DomainName: !Ref ApiDomain
+      Stage: $default
+
 Outputs:
   ApiUrl:
     Description: 访问页面/接口的地址
     Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  ApiDomainTarget:
+    Condition: HasCustomDomain
+    Description: 在 Cloudflare 把 ApiDomainName 用 DNS-only CNAME 指向这个地址
+    Value: !GetAtt ApiDomain.RegionalDomainName
   DBEndpoint:
     Description: Aurora 写入端点
     Value: !GetAtt DBCluster.Endpoint.Address
   AuthSecretArn:
     Description: 取 Basic Auth 密码 (aws secretsmanager get-secret-value --secret-id <此ARN>)
     Value: !Ref AuthSecret
+
+  # ─── 跨栈导出：供 infra/ecs-fargate.yaml（Task 2）用 Fn::ImportValue 引用 ───
+  # 主栈是网络与数据的唯一属主，ECS 栈只消费、不重复建 VPC/子网/数据库。
+  VpcId:
+    Value: !Ref Vpc
+    Export: { Name: !Sub "${AWS::StackName}-VpcId" }
+  PublicSubnetId:
+    Value: !Ref PublicSubnet
+    Export: { Name: !Sub "${AWS::StackName}-PublicSubnet" }
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+    Export: { Name: !Sub "${AWS::StackName}-PrivateSubnet1" }
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2
+    Export: { Name: !Sub "${AWS::StackName}-PrivateSubnet2" }
+  DBSecurityGroupId:
+    Value: !Ref DBSecurityGroup
+    Export: { Name: !Sub "${AWS::StackName}-DBSecurityGroup" }
+  LambdaSecurityGroupId:
+    Value: !Ref LambdaSecurityGroup
+    Export: { Name: !Sub "${AWS::StackName}-LambdaSecurityGroup" }
+  ApiFunctionArn:
+    Value: !GetAtt ApiFunction.Arn
+    Export: { Name: !Sub "${AWS::StackName}-ApiFunctionArn" }
+  ApiEndpoint:
+    Description: Hono HTTP API 域名（ECS Go 服务经 Cloud Map 指向它）
+    Value: !Sub "${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+    Export: { Name: !Sub "${AWS::StackName}-ApiEndpoint" }
+  DBSecretArn:
+    Value: !Ref DBSecret
+    Export: { Name: !Sub "${AWS::StackName}-DBSecretArn" }
+  AuthSecretArnExport:
+    Value: !Ref AuthSecret
+    Export: { Name: !Sub "${AWS::StackName}-AuthSecretArn" }
+  DBName:
+    Value: !Ref DBName
+    Export: { Name: !Sub "${AWS::StackName}-DBName" }
+  DBUsername:
+    Value: !Ref DBUsername
+    Export: { Name: !Sub "${AWS::StackName}-DBUsername" }
+  DBClusterEndpoint:
+    Value: !GetAtt DBCluster.Endpoint.Address
+    Export: { Name: !Sub "${AWS::StackName}-DBClusterEndpoint" }

@@ -1,0 +1,129 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Task 3 (per-PR): one ephemeral Fargate task running the go-api image plus a
+  throwaway Postgres sidecar, so each pull request gets a fully isolated dev
+  environment. Deployed and torn down by the CodeBuild project in pr-preview.yaml.
+  Networking is imported from the main stack; nothing here touches prod data.
+
+Parameters:
+  MainStackName:
+    Type: String
+    Default: github-repositories-fllow
+  PrNumber:
+    Type: String
+    Description: PR 编号，用于命名与 Cloudflare 子域 pr-<num>。
+  ImageUri:
+    Type: String
+    Description: 本次 PR 构建并推送的 go-api 镜像（含 tag）。
+  RuntimeRoleArn:
+    Type: String
+    Description: 预览任务的执行/任务角色（pr-preview.yaml 的 PrPreviewRuntimeRole）。
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/ecs/${MainStackName}-pr-${PrNumber}"
+      RetentionInDays: 3
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${MainStackName}-pr-${PrNumber}"
+
+  # 预览环境安全组：公有子网 + 公网 IP，放行 8080 供 Cloudflare 回源。
+  PreviewSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PR preview task - allow 8080 for Cloudflare origin
+      VpcId: !ImportValue
+        Fn::Sub: "${MainStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub "${MainStackName}-pr-${PrNumber}-sg" }]
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${MainStackName}-pr-${PrNumber}"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !Ref RuntimeRoleArn
+      TaskRoleArn: !Ref RuntimeRoleArn
+      ContainerDefinitions:
+        # 一次性 Postgres：随任务生死，PR 环境彼此隔离、绝不碰生产库
+        - Name: postgres
+          Image: public.ecr.aws/docker/library/postgres:16-alpine
+          Essential: true
+          Environment:
+            - { Name: POSTGRES_USER, Value: postgres }
+            - { Name: POSTGRES_PASSWORD, Value: postgres }
+            - { Name: POSTGRES_DB, Value: appdb }
+          PortMappings:
+            - { ContainerPort: 5432, Protocol: tcp }
+          HealthCheck:
+            Command: ["CMD-SHELL", "pg_isready -U postgres -d appdb"]
+            Interval: 10
+            Timeout: 5
+            Retries: 5
+            StartPeriod: 20
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: postgres
+        - Name: go-api
+          Image: !Ref ImageUri
+          Essential: true
+          # 等 Postgres 健康再启动，冷启动 ensureSchema 才能建表
+          DependsOn:
+            - { ContainerName: postgres, Condition: HEALTHY }
+          Environment:
+            - { Name: PORT, Value: "8080" }
+            - { Name: DATABASE_URL, Value: "postgresql://postgres:postgres@localhost:5432/appdb?sslmode=disable" }
+            # 预览环境默认不开 Basic Auth，方便直接点开验证
+          PortMappings:
+            - { ContainerPort: 8080, Protocol: tcp }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: go-api
+
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${MainStackName}-pr-${PrNumber}"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          # 公有子网 + 公网 IP：Cloudflare 直接回源到任务公网 IP
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !ImportValue
+              Fn::Sub: "${MainStackName}-PublicSubnet"
+          SecurityGroups: [!Ref PreviewSecurityGroup]
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !Sub "${MainStackName}-pr-${PrNumber}"

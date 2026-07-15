@@ -72,6 +72,28 @@ Resources:
               - ec2:DescribeSecurityGroups
             Resource: "*"
 
+  # ECS 任务执行/任务角色的权限边界（Task 2 的 ecs-fargate.yaml 按名引用）。
+  # 与 Lambda 边界同理：由 admin 持有，CI 只能挂不能改，封顶 ECS 角色实际权限。
+  EcsTaskPermissionsBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${DeployStackName}-ecs-boundary"
+      Description: Upper bound for ECS task/execution roles created by the deploy role
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - secretsmanager:GetSecretValue
+            Resource: "*"
+
   DeployRole:
     Type: AWS::IAM::Role
     Properties:
@@ -110,6 +132,12 @@ Resources:
                   - rds:*
                   - secretsmanager:*
                   - logs:*
+                  # Task 2：ECS/Fargate + ECR + ALB + Cloud Map
+                  - ecs:*
+                  - ecr:*
+                  - elasticloadbalancing:*
+                  - servicediscovery:*
+                  - application-autoscaling:*
                 Resource: "*"
                 Condition:
                   StringEquals:
@@ -136,7 +164,10 @@ Resources:
                   - !Sub "arn:aws:iam::${AWS::AccountId}:role/${DeployStackName}-*"
                 Condition:
                   StringEquals:
-                    iam:PermissionsBoundary: !Ref LambdaPermissionsBoundary
+                    # 必须挂 Lambda 或 ECS 边界之一，二者都由 admin 持有、CI 无权修改
+                    iam:PermissionsBoundary:
+                      - !Ref LambdaPermissionsBoundary
+                      - !Ref EcsTaskPermissionsBoundary
               # 读取/删除/打标：限本栈前缀（删除角色不支持边界条件，靠前缀约束；
               # 未授予 DeleteRolePermissionsBoundary，因此边界无法被剥离）
               - Sid: ReadDeleteStackRoles
@@ -151,15 +182,17 @@ Resources:
                   - iam:UntagRole
                 Resource:
                   - !Sub "arn:aws:iam::${AWS::AccountId}:role/${DeployStackName}-*"
-              # PassRole 仅允许把本栈角色交给 Lambda
-              - Sid: PassRoleToLambda
+              # PassRole 仅允许把本栈角色交给 Lambda 或 ECS 任务
+              - Sid: PassRoleToLambdaOrEcs
                 Effect: Allow
                 Action: iam:PassRole
                 Resource:
                   - !Sub "arn:aws:iam::${AWS::AccountId}:role/${DeployStackName}-*"
                 Condition:
                   StringEquals:
-                    iam:PassedToService: lambda.amazonaws.com
+                    iam:PassedToService:
+                      - lambda.amazonaws.com
+                      - ecs-tasks.amazonaws.com
               # RDS 等服务首次使用需要的服务关联角色
               - Sid: ServiceLinkedRoles
                 Effect: Allow
@@ -173,3 +206,6 @@ Outputs:
   LambdaBoundaryArn:
     Description: Lambda 角色的权限边界 ARN（主栈会按名字引用它）
     Value: !Ref LambdaPermissionsBoundary
+  EcsBoundaryArn:
+    Description: ECS 任务角色的权限边界 ARN（Task 2 ecs-fargate.yaml 按名字引用它）
+    Value: !Ref EcsTaskPermissionsBoundary

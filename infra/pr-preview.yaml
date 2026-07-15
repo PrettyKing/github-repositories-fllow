@@ -1,0 +1,212 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Task 3 (bootstrap): PR-based ephemeral dev environments for the Go service,
+  wired by Cloudflare + CodeBuild + three IAM roles. Admin-provisioned once
+  (like github-oidc.yaml). A GitHub PR triggers CodeBuild, which builds the Go
+  image, deploys a per-PR stack (pr-preview-env.yaml) and points a Cloudflare
+  subdomain pr-<num> at it; closing the PR tears everything down.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub 用户名/组织（如 PrettyKing）。
+  GitHubRepo:
+    Type: String
+    Default: github-repositories-fllow
+  MainStackName:
+    Type: String
+    Default: github-repositories-fllow
+  DeployRegion:
+    Type: String
+    Default: ap-northeast-1
+  CloudflareZone:
+    Type: String
+    Description: 预览子域所在的 Cloudflare 区域根域，如 dev.example.com。
+
+Resources:
+  # ──────────────────────────── ECR（预览镜像仓库）────────────────────────────
+  PreviewEcrRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub "${MainStackName}-pr-preview"
+      EmptyOnDelete: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              { "rulePriority": 1, "description": "expire untagged after 1 day",
+                "selection": { "tagStatus": "untagged", "countType": "sinceImagePushed", "countUnit": "days", "countNumber": 1 },
+                "action": { "type": "expire" } },
+              { "rulePriority": 2, "description": "keep last 20 preview images",
+                "selection": { "tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 20 },
+                "action": { "type": "expire" } }
+            ]
+          }
+
+  # Cloudflare API Token（占位）：建栈后由 admin 填入，CodeBuild 只读取，绝不入仓。
+  #   aws secretsmanager put-secret-value --secret-id <此ARN> \
+  #     --secret-string '{"apiToken":"<token>","zoneId":"<zoneId>"}'
+  CloudflareSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${MainStackName}/cloudflare"
+      Description: Cloudflare API token and zone id for PR preview DNS
+
+  # ──────────────────────────── 角色 1/3：PR 触发角色（GitHub OIDC）────────────────────────────
+  # PR 工作流经 OIDC 假设它，仅能 StartBuild 本预览项目 —— 不给任何部署权限，最小面。
+  PrPreviewTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${GitHubRepo}-pr-preview-trigger"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub "arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                # 只允许本仓库的 PR 工作流（pull_request 环境）假设
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOrg}/${GitHubRepo}:pull_request"
+      Policies:
+        - PolicyName: start-preview-build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt PrPreviewProject.Arn
+
+  # ──────────────────────────── 角色 2/3：CodeBuild 构建/部署角色 ────────────────────────────
+  PrPreviewBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${GitHubRepo}-pr-preview-build"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: build-and-deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${DeployRegion}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                  - ecr:BatchGetImage
+                Resource: "*"
+              - Sid: DeployPerPrStack
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplateSummary
+                  - ecs:*
+                  - ec2:Describe*
+                  - ec2:CreateSecurityGroup
+                  - ec2:DeleteSecurityGroup
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:DescribeLogGroups
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:RequestedRegion: !Ref DeployRegion
+              - Sid: ReadCloudflareSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref CloudflareSecret
+              # 只能把预览运行角色交给 ECS 任务
+              - Sid: PassRuntimeRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt PrPreviewRuntimeRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+  # ──────────────────────────── 角色 3/3：预览任务运行角色 ────────────────────────────
+  # 被每个 PR 的 Fargate 任务用作 ExecutionRole 与 TaskRole（拉镜像 + 写日志）。
+  PrPreviewRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${GitHubRepo}-pr-preview-runtime"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # ──────────────────────────── CodeBuild 项目 ────────────────────────────
+  PrPreviewProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${MainStackName}-pr-preview"
+      Description: Build go-api image and deploy or destroy a per-PR preview env
+      ServiceRole: !GetAtt PrPreviewBuildRole.Arn
+      Artifacts: { Type: NO_ARTIFACTS }
+      Source:
+        Type: GITHUB
+        Location: !Sub "https://github.com/${GitHubOrg}/${GitHubRepo}.git"
+        BuildSpec: apps/go-api/buildspec.pr.yml
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+        PrivilegedMode: true # docker build 需要
+        EnvironmentVariables:
+          - { Name: MAIN_STACK_NAME, Value: !Ref MainStackName }
+          - { Name: AWS_DEFAULT_REGION, Value: !Ref DeployRegion }
+          - { Name: PREVIEW_ECR_URI, Value: !GetAtt PreviewEcrRepo.RepositoryUri }
+          - { Name: RUNTIME_ROLE_ARN, Value: !GetAtt PrPreviewRuntimeRole.Arn }
+          - { Name: CLOUDFLARE_SECRET_ARN, Value: !Ref CloudflareSecret }
+          - { Name: CLOUDFLARE_ZONE, Value: !Ref CloudflareZone }
+      TimeoutInMinutes: 20
+
+Outputs:
+  TriggerRoleArn:
+    Description: 填到 GitHub Secrets 的 AWS_PR_PREVIEW_TRIGGER_ROLE_ARN
+    Value: !GetAtt PrPreviewTriggerRole.Arn
+  CodeBuildProjectName:
+    Value: !Ref PrPreviewProject
+  CloudflareSecretArn:
+    Description: 建栈后 put-secret-value 填入 apiToken/zoneId
+    Value: !Ref CloudflareSecret
+  PreviewEcrUri:
+    Value: !GetAtt PreviewEcrRepo.RepositoryUri

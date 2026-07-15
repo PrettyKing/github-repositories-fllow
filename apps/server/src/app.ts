@@ -1,18 +1,16 @@
-import type { GithubUser } from "@github-repositories-fllow/db";
-import { db, ensureSchema, githubRepos, githubUsers } from "@github-repositories-fllow/db";
 import { env } from "@github-repositories-fllow/env/server";
-import { serveStatic } from "@hono/node-server/serve-static";
-import { desc, eq, isNotNull, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { basicAuth } from "hono/basic-auth";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
-import { z } from "zod";
 
-import type { GithubApiUser } from "./github";
-import { fetchGithubRepos, fetchGithubUser, toNewGithubRepos, toNewGithubUser } from "./github";
+import { generateBio } from "./openrouter";
+import type { RawProfile } from "./openrouter";
 
 export const app = new Hono();
+
+// Go 服务地址（云端为 Cloud Map 内网 DNS）。Lambda 只做校验/转发/OpenRouter，不连库。
+const goBase = env.GO_API_URL.replace(/\/$/, "");
 
 app.use(logger());
 app.use(
@@ -23,8 +21,8 @@ app.use(
   }),
 );
 
-// 鉴权：配置了 Basic Auth 凭据时，保护页面与所有接口（/health 放行给监控）。
-// 页面、列表、增、删都在网关之后，避免任何人公开读写/删除数据。
+// 鉴权：配置了 Basic Auth 凭据时保护页面与所有接口（/health 放行给监控）。
+// 这是 Lambda 侧的「校验」职责；更细的业务校验由 Go（最终校验方）负责。
 if (env.BASIC_AUTH_USER && env.BASIC_AUTH_PASSWORD) {
   const guard = basicAuth({
     username: env.BASIC_AUTH_USER,
@@ -33,247 +31,56 @@ if (env.BASIC_AUTH_USER && env.BASIC_AUTH_PASSWORD) {
   app.use("*", (c, next) => (c.req.path === "/health" ? next() : guard(c, next)));
 }
 
-// 用库前确保表存在（幂等，容器内只跑一次）
-app.use("/api/*", async (_c, next) => {
-  await ensureSchema();
-  return next();
-});
-
-// 健康检查（API Gateway / 监控用）
-app.get("/health", (c) => c.json({ status: "ok" }));
-
-const tokenSchema = z.object({ token: z.string().min(1, "token 不能为空") });
-
-/**
- * 共享：upsert 账户 + 事务内重置仓库，返回更新后的账户行。
- * POST /api/github 与 POST /api/users/:id/refresh 都走此函数，避免重复逻辑。
- */
-interface SyncResult {
-  row: GithubUser;
-  created: boolean;
-  reposCount: number;
-  truncated: boolean;
+// 转发时复用来路请求头（含 Authorization 透传给 Go），去掉会导致目标不一致的头。
+function forwardHeaders(h: Headers): Headers {
+  const out = new Headers(h);
+  out.delete("host");
+  out.delete("content-length");
+  return out;
 }
 
-async function syncGithubData(ghUser: GithubApiUser, token: string): Promise<SyncResult> {
-  const newUser = toNewGithubUser(ghUser);
+// 健康检查：反映 Lambda 自身存活；数据库探活由 Go 的 /health 负责，Lambda 不连库。
+app.get("/health", (c) => c.json({ status: "ok", role: "proxy" }));
 
-  // 先判断是新建还是更新（供响应区分 created）
-  const [existing] = await db
-    .select({ id: githubUsers.id })
-    .from(githubUsers)
-    .where(eq(githubUsers.githubId, ghUser.id))
-    .limit(1);
-  const created = !existing;
-
-  // 单语句 upsert 避免并发竞态；conflict 时更新业务字段，不改 created_at
-  const [row] = await db
-    .insert(githubUsers)
-    .values(newUser)
-    .onConflictDoUpdate({
-      target: githubUsers.githubId,
-      set: {
-        login: newUser.login,
-        name: newUser.name ?? null,
-        avatarUrl: newUser.avatarUrl ?? null,
-        bio: newUser.bio ?? null,
-        company: newUser.company ?? null,
-        location: newUser.location ?? null,
-        publicRepos: newUser.publicRepos ?? 0,
-        followers: newUser.followers ?? 0,
-        following: newUser.following ?? 0,
-        htmlUrl: newUser.htmlUrl ?? null,
-        updatedAt: sql`now()`,
-      },
-    })
-    .returning();
-
-  if (!row) throw new Error("账户 upsert 异常");
-
-  // 翻页拉取自有仓库（上限 300）
-  const { repos: apiRepos, truncated } = await fetchGithubRepos(token);
-  const newRepos = toNewGithubRepos(row.id, apiRepos);
-
-  // 先删后插必须在事务内，避免删成功插失败导致仓库数据丢失；
-  // onConflictDoNothing 兜并发：复合唯一约束 (user_id, repo_id) 下不硬失败
-  await db.transaction(async (tx) => {
-    await tx.delete(githubRepos).where(eq(githubRepos.userId, row.id));
-    if (newRepos.length > 0) {
-      await tx.insert(githubRepos).values(newRepos).onConflictDoNothing();
+// profile：转发到 Go 取原始公开信息后，调 OpenRouter 生成 introduction 合并返回。
+// 这是「Lambda 调 OpenRouter 生成 bio」的落点。注册在通用代理之前，优先匹配。
+app.get("/api/profile/:username", async (c) => {
+  const target = `${goBase}/api/profile/${encodeURIComponent(c.req.param("username"))}`;
+  try {
+    const res = await fetch(target, { headers: forwardHeaders(c.req.raw.headers) });
+    if (!res.ok) {
+      const text = await res.text();
+      return new Response(text, {
+        status: res.status,
+        headers: { "content-type": "application/json" },
+      });
     }
-  });
-
-  return { row, created, reposCount: newRepos.length, truncated };
-}
-
-// 新增/更新账户：用 token 拉 GitHub 账户信息并 upsert，同步仓库
-app.post("/api/github", async (c) => {
-  const body = await c.req.json().catch(() => ({}));
-  const parsed = tokenSchema.safeParse(body);
-  if (!parsed.success) {
-    return c.json({ error: parsed.error.issues[0]?.message ?? "参数错误" }, 400);
+    const raw = (await res.json()) as RawProfile;
+    const introduction = await generateBio(raw);
+    return c.json({ ...raw, introduction });
+  } catch {
+    return c.json({ error: "Go 服务不可达" }, 502);
   }
+});
 
+// 其余 /api/* 透明转发到 Go（Go 是唯一 DB 访问方）。
+app.all("/api/*", async (c) => {
+  const url = new URL(c.req.url);
+  const target = `${goBase}${url.pathname}${url.search}`;
+  const method = c.req.method;
+  const init: RequestInit = { method, headers: forwardHeaders(c.req.raw.headers) };
+  if (method !== "GET" && method !== "HEAD") {
+    // 缓冲 body 再转发：跨 API Gateway/ALB 适配器比透传流更稳（请求体都很小）。
+    init.body = await c.req.arrayBuffer();
+  }
   try {
-    const ghUser = await fetchGithubUser(parsed.data.token);
-    const { row, created, reposCount, truncated } = await syncGithubData(
-      ghUser,
-      parsed.data.token,
-    );
-    return c.json({ ...row, created, reposCount, truncated }, created ? 201 : 200);
-  } catch (err) {
-    return c.json({ error: err instanceof Error ? err.message : "未知错误" }, 502);
+    const res = await fetch(target, init);
+    return new Response(res.body, { status: res.status, headers: res.headers });
+  } catch {
+    return c.json({ error: "Go 服务不可达" }, 502);
   }
 });
 
-// 账户列表（select * 含 updatedAt，createdAt 倒序）
-app.get("/api/users", async (c) => {
-  const rows = await db.select().from(githubUsers).orderBy(desc(githubUsers.createdAt));
-  return c.json(rows);
-});
-
-// 删除账户（仓库由 DB 外键 ON DELETE CASCADE 自动清除，无需应用层手删）
-app.delete("/api/users/:id", async (c) => {
-  const id = Number(c.req.param("id"));
-  if (!Number.isInteger(id) || id <= 0) return c.json({ error: "id 非法" }, 400);
-  await db.delete(githubUsers).where(eq(githubUsers.id, id));
-  return c.json({ ok: true });
-});
-
-// 查询账户仓库列表，按 pushedAt 倒序，未推送的仓库排最后
-app.get("/api/users/:id/repos", async (c) => {
-  const id = Number(c.req.param("id"));
-  if (!Number.isInteger(id) || id <= 0) return c.json({ error: "id 非法" }, 400);
-
-  const rows = await db
-    .select()
-    .from(githubRepos)
-    .where(eq(githubRepos.userId, id))
-    .orderBy(sql`${githubRepos.pushedAt} DESC NULLS LAST`);
-  return c.json(rows);
-});
-
-// 刷新账户：用新 token 重新同步该账户的 GitHub 信息与仓库
-app.post("/api/users/:id/refresh", async (c) => {
-  const id = Number(c.req.param("id"));
-  if (!Number.isInteger(id) || id <= 0) return c.json({ error: "id 非法" }, 400);
-
-  const body = await c.req.json().catch(() => ({}));
-  const parsed = tokenSchema.safeParse(body);
-  if (!parsed.success) {
-    return c.json({ error: parsed.error.issues[0]?.message ?? "参数错误" }, 400);
-  }
-  const { token } = parsed.data;
-
-  try {
-    // 确认目标账户存在
-    const [target] = await db
-      .select({ githubId: githubUsers.githubId })
-      .from(githubUsers)
-      .where(eq(githubUsers.id, id))
-      .limit(1);
-    if (!target) return c.json({ error: "用户不存在" }, 400);
-
-    const ghUser = await fetchGithubUser(token);
-
-    // 校验 token 对应的 GitHub 账户与目标记录一致，防止用别的 token 错刷
-    if (ghUser.id !== target.githubId) {
-      return c.json({ error: "Token 与目标账户不匹配" }, 400);
-    }
-
-    const { row, reposCount, truncated } = await syncGithubData(ghUser, token);
-    return c.json({ ...row, reposCount, truncated });
-  } catch (err) {
-    return c.json({ error: err instanceof Error ? err.message : "未知错误" }, 502);
-  }
-});
-
-// 统计面板：聚合账户数、仓库数、followers 合计、语言分布
-app.get("/api/stats", async (c) => {
-  try {
-    const TOP_LANG = 8;
-
-    const [[userAgg], [repoAgg], topUsers, langRows] = await Promise.all([
-      // 账户汇总（空表时 count=0，sum 用 coalesce 兜 null）
-      db
-        .select({
-          users: sql<number>`count(*)::int`,
-          totalFollowers: sql<number>`coalesce(sum(${githubUsers.followers}), 0)::int`,
-          totalPublicRepos: sql<number>`coalesce(sum(${githubUsers.publicRepos}), 0)::int`,
-        })
-        .from(githubUsers),
-      // 仓库总数
-      db.select({ repos: sql<number>`count(*)::int` }).from(githubRepos),
-      // Top 5 账户（followers 倒序）
-      db
-        .select({
-          login: githubUsers.login,
-          name: githubUsers.name,
-          followers: githubUsers.followers,
-        })
-        .from(githubUsers)
-        .orderBy(desc(githubUsers.followers))
-        .limit(5),
-      // 语言分布（仅非 null，按出现次数倒序）
-      db
-        .select({
-          name: githubRepos.language,
-          count: sql<number>`count(*)::int`,
-        })
-        .from(githubRepos)
-        .where(isNotNull(githubRepos.language))
-        .groupBy(githubRepos.language)
-        .orderBy(sql`count(*) desc`),
-    ]);
-
-    const totalRepoCount = repoAgg?.repos ?? 0;
-
-    // 语言占比分母用「有语言的仓库总数」（排除 language=null），确保各占比之和≈100%
-    const languagedTotal = langRows.reduce((acc, r) => acc + r.count, 0);
-
-    // 取前 TOP_LANG 语言，其余归并为「其他」
-    const topLangs = langRows.slice(0, TOP_LANG);
-    const otherCount = langRows.slice(TOP_LANG).reduce((acc, r) => acc + r.count, 0);
-
-    const languages = [
-      ...topLangs.map((r) => ({
-        name: r.name ?? "Unknown",
-        count: r.count,
-        percent: languagedTotal > 0 ? Math.round((r.count / languagedTotal) * 100) : 0,
-      })),
-      ...(otherCount > 0
-        ? [
-            {
-              name: "其他",
-              count: otherCount,
-              percent:
-                languagedTotal > 0 ? Math.round((otherCount / languagedTotal) * 100) : 0,
-            },
-          ]
-        : []),
-    ];
-
-    return c.json({
-      users: userAgg?.users ?? 0,
-      repos: totalRepoCount,
-      totalFollowers: userAgg?.totalFollowers ?? 0,
-      totalPublicRepos: userAgg?.totalPublicRepos ?? 0,
-      topUsers,
-      languages,
-    });
-  } catch (err) {
-    return c.json({ error: err instanceof Error ? err.message : "统计查询失败" }, 502);
-  }
-});
-
-// 未匹配的 /api 路径返回 JSON 404，避免被下方 SPA fallback 当作页面返回 HTML
-// （否则前端 fetch 见 200 后用 res.json() 解析 HTML 抛 SyntaxError）。
-app.all("/api/*", (c) => c.json({ error: "Not Found" }, 404));
-
-// ── 前端 React SPA（同 Lambda 托管静态）─────────────────────────
-// 静态资源置于部署包内的 client/（构建时由 web 产出拷入 dist/client）。
-// root 相对启动时 cwd：Lambda = /var/task，故解析为 /var/task/client。
-// 注册在 /api 与 /health 之后，确保接口优先匹配、不被静态/兜底吞掉。
-app.use("*", serveStatic({ root: "./client", index: "index.html" }));
-// SPA fallback：未命中静态文件的客户端路由统一回 index.html，由前端接管路由。
-app.get("*", serveStatic({ path: "./client/index.html" }));
+// 前端已迁到 Cloudflare Pages（Next.js 静态导出），Lambda 不再托管任何静态资源，
+// 只做「校验 + 转发 + OpenRouter」的纯 API 网关。根路径无内容返回 JSON 提示。
+app.get("/", (c) => c.json({ service: "api-gateway", web: "https://app.faithcal.xyz" }));

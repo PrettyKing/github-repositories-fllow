@@ -51,12 +51,28 @@ export interface Stats {
   languages: { name: string; count: number; percent: number }[];
 }
 
+export interface GithubProfile {
+  username: string;
+  name: string | null;
+  avatarUrl: string | null;
+  bio: string | null;
+  location: string | null;
+  publicRepos: number;
+  followers: number;
+  following: number;
+  htmlUrl: string | null;
+  introduction: string;
+}
+
 /**
  * 统一请求封装：fetch → 非 2xx 读 { error } 字段抛出 → 2xx 返回 JSON。
- * 基础地址使用相对路径 /api：生产同源直接访问，dev 经 Vite proxy 转发到 Hono(3000)，零 CORS 暴露面。
+ * 基础地址默认相对 /api：生产由 Cloudflare Pages 的 _redirects 同源代理到 api.faithcal.xyz，
+ * dev 经 Next 代理/相对路径转发到 Hono(3000)，零 CORS 暴露面。可用 NEXT_PUBLIC_API_BASE 覆盖。
  */
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "/api";
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`/api${path}`, {
+  const res = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json" },
     ...init,
   });
@@ -101,4 +117,9 @@ export function refreshUser(id: number, token: string): Promise<SyncResult> {
 /** 获取全局统计数据 */
 export function getStats(): Promise<Stats> {
   return request<Stats>("/stats");
+}
+
+/** 生成个人介绍：走统一 /api（Lambda 转发到 Go 取数 + 调 OpenRouter 生成介绍）。 */
+export function getGithubProfile(username: string): Promise<GithubProfile> {
+  return request<GithubProfile>(`/profile/${encodeURIComponent(username)}`);
 }
