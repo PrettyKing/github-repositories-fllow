@@ -137,6 +137,19 @@ Resources:
                   - codebuild:StartBuild
                   - codebuild:BatchGetBuilds
                 Resource: !GetAtt PrPreviewBuildProject.Arn
+              # 账号 CodeBuild 配额 0，改在 Actions buildx 打镜像 → Ops 角色需 ECR push
+              - Sid: EcrPush
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: "*"
               # ListStacks 不能按资源收窄，单列一条放行（reconciler 枚举预览栈用）
               - Sid: ListStacks
                 Effect: Allow
