@@ -1,3 +1,0 @@
-# Cloudflare Pages 同源代理：前端只见 app.faithcal.xyz/api，实际打到 API Gateway。
-# 保留 Basic Auth 的同源 UX，避开跨域（贴合架构图「Web 只访问 API Gateway」）。
-/api/*  https://api.faithcal.xyz/api/:splat  200
