@@ -26,7 +26,7 @@
 
 ## 第二次 PRD（2026-06-28）切分为 4 个 feature
 
-> 来源需求：`docs/需求-前端react化.md`、`docs/需求-账户仓库收集增强.md`。
+> 来源需求：`docs/需求-账户仓库收集增强.md`（前端 React 化需求文档已归档；前端后续又迁至 Next.js/Cloudflare Pages，当前架构见 `docs/架构图.md`）。
 > 在已交付的 1–4 基线之上做增强，编号从 5 续。
 
 | 序号 | feature                 | 说明                                                  | 依赖                | 状态   |
