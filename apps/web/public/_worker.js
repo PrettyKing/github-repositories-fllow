@@ -34,3 +34,5 @@ export default {
     return env.ASSETS.fetch(request);
   },
 };
+
+// redeploy: pick up Pages env vars (API_ORIGIN / BASIC_AUTH_*)
