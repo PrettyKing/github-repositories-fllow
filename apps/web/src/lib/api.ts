@@ -45,6 +45,7 @@ export interface GithubRepo {
 export interface Stats {
   users: number;
   repos: number;
+  totalStars: number;
   totalFollowers: number;
   totalPublicRepos: number;
   topUsers: { login: string; name: string | null; followers: number }[];
