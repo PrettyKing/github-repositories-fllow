@@ -36,8 +36,12 @@ jobs:
       PR: ${{ github.event.pull_request.number }}
       SHA: ${{ github.event.pull_request.head.sha }}
     steps:
-      # 只取 base 分支的可信内容（模板 infra/*.yaml、脚本 scripts/*）
+      # 只取 base 分支的可信内容（CDK app infra/cdk、脚本 scripts/*）
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
       - name: Guard - PR 仍为 open
         env:
@@ -86,23 +90,22 @@ jobs:
             esac
           done
 
-      - name: Deploy per-PR stack
+      # 用 CDK 部署每 PR 栈（CliCredentialsStackSynthesizer：用 Ops 角色直接部署，免 bootstrap）
+      - name: Deploy per-PR stack (CDK)
+        working-directory: infra/cdk
         run: |
           set -euo pipefail
-          # 打标签供夜间 reconciler 兜底清扫（即便 destroy 偶发失败也能限制成本）
           EXPIRES=$(date -u -d '+7 days' +%Y-%m-%dT%H:%M:%SZ)
-          aws cloudformation deploy \
-            --template-file infra/pr-preview-env.yaml \
-            --stack-name "${MAIN_STACK}-pr-${PR}" \
-            --capabilities CAPABILITY_IAM \
-            --no-fail-on-empty-changeset \
-            --parameter-overrides \
-              MainStackName="$MAIN_STACK" PrNumber="$PR" \
-              ImageUri="${ECR_URI}:${TAG}" RuntimeRoleArn="$RUNTIME_ROLE_ARN" \
-              PreviewZone="$CF_ZONE" \
-            --tags \
-              Environment=preview Repository="$GITHUB_REPOSITORY" \
-              PullRequest="$PR" CommitSha="$SHA" ExpiresAt="$EXPIRES"
+          npm install --no-audit --no-fund
+          npx cdk deploy "${MAIN_STACK}-pr-${PR}" --require-approval never \
+            -c mainStackName="$MAIN_STACK" -c prNumber="$PR" \
+            -c imageUri="${ECR_URI}:${TAG}" -c runtimeRoleArn="$RUNTIME_ROLE_ARN" \
+            -c previewZone="$CF_ZONE" \
+            --tags Environment=preview --tags Repository="$GITHUB_REPOSITORY" \
+            --tags PullRequest="$PR" --tags CommitSha="$SHA" --tags ExpiresAt="$EXPIRES"
+
+      - name: Wait for service stable
+        run: |
           aws ecs wait services-stable \
             --cluster "${MAIN_STACK}-pr-${PR}" --services "${MAIN_STACK}-pr-${PR}"
 

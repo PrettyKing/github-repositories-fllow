@@ -141,23 +141,16 @@ Resources:
                 Effect: Allow
                 Action: cloudformation:ListStacks
                 Resource: "*"
+              # 收窄到 -pr-* 栈；cloudformation:* 覆盖 CDK 的 changeset/GetTemplate 等调用
               - Sid: DeployPerPrStacks
                 Effect: Allow
-                Action:
-                  - cloudformation:CreateStack
-                  - cloudformation:UpdateStack
-                  - cloudformation:DeleteStack
-                  - cloudformation:CreateChangeSet
-                  - cloudformation:ExecuteChangeSet
-                  - cloudformation:DescribeChangeSet
-                  - cloudformation:DescribeStacks
-                  - cloudformation:DescribeStackEvents
-                  - cloudformation:GetTemplateSummary
+                Action: cloudformation:*
                 Resource: !Sub "arn:aws:cloudformation:${DeployRegion}:${AWS::AccountId}:stack/${MainStackName}-pr-*/*"
               - Sid: PerPrResources
                 Effect: Allow
                 Action:
                   - ecs:*
+                  - elasticloadbalancing:*
                   - ec2:Describe*
                   - ec2:CreateSecurityGroup
                   - ec2:DeleteSecurityGroup

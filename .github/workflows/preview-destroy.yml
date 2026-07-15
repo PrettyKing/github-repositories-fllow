@@ -30,33 +30,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_PR_PREVIEW_OPS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Delete per-PR stack (fail on DELETE_FAILED)
+      - name: Destroy per-PR stack (CDK, fail on DELETE_FAILED)
+        working-directory: infra/cdk
         run: |
           set -euo pipefail
           STACK="${MAIN_STACK}-pr-${PR}"
           if ! aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; then
             echo "栈 $STACK 不存在 —— 幂等成功"; exit 0
           fi
-          echo "删除 $STACK ..."
-          aws cloudformation delete-stack --stack-name "$STACK"
-          if aws cloudformation wait stack-delete-complete --stack-name "$STACK" 2>/dev/null; then
-            echo "已删除"
-          else
-            # wait 失败：区分「已删掉（竞态）」与「真的 DELETE_FAILED」
-            st=$(aws cloudformation describe-stacks --stack-name "$STACK" \
-              --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo GONE)
-            if [ "$st" = "GONE" ]; then
-              echo "栈已消失（ok）"
-            else
-              echo "::error::栈删除失败，状态=$st，需人工介入"; exit 1
-            fi
+          npm install --no-audit --no-fund
+          # cdk destroy 用同样的 PR 参数合成同名栈并请求删除；失败会非零退出（不吞 DELETE_FAILED）
+          npx cdk destroy "$STACK" --force \
+            -c mainStackName="$MAIN_STACK" -c prNumber="$PR" -c previewZone="$CF_ZONE"
+          # 复核确实删掉
+          if aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1; then
+            st=$(aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text)
+            echo "::error::栈仍存在，状态=$st，需人工介入"; exit 1
           fi
+          echo "已删除"
 
       - name: Read Cloudflare secret + delete DNS
         run: |

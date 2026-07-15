@@ -320,7 +320,8 @@ PR 中的代码是不可信输入，尤其需要避免以下模式：
 4. ✅ 删除失败可见，不吞 `DELETE_FAILED`。→ destroy 仅把「栈本不存在」当幂等成功，其余非成功状态 `::error::` 并让工作流失败。
 5. ✅ 部署/销毁并发竞态。→ 同一 concurrency 组 `preview-pr-<n>` 串行 + 部署前 open-guard + **`preview-reconcile.yml` 每晚孤儿清扫**（按 `Environment=preview` 标签 + PR 状态/`ExpiresAt`）。
 6. ✅ 动态公网 IP → 稳定入口。→ **长期共享 ALB**（`infra/pr-preview.yaml` 内，Host 路由）；每 PR 任务改**私有子网+目标组+Host 监听规则**；Cloudflare **DNS-only CNAME → ALB**，`http://api-pr-<n>.faithcal.xyz`（无端口，任务 IP 变化被目标组屏蔽）。仍为 HTTP（免证书）；要 HTTPS 需给 ALB 挂 ACM。
-7. ⬜ 每 PR CloudFormation 模板迁 CDK Construct（建议最后再评估，非必须）。
+7. ✅ 每 PR 模板迁 CDK。→ `infra/cdk`（`PreviewPrStack`，L2 构造，等价原 `pr-preview-env.yaml`）。用 **`CliCredentialsStackSynthesizer`**：`cdk deploy/destroy` 直接用 Actions 假设的 **Ops 角色**部署，**免 `cdk bootstrap`、不引入宽权限 CDK 角色**（贴合 §10 安全边界）。`preview-deploy.yml` → `cdk deploy`，`preview-destroy.yml` → `cdk destroy --force`；夜间 reconciler 仍按栈名 `delete-stack`（CDK 产出的就是普通 CFN 栈）。
 
-> 注：共享 ALB 常驻计费（~$16/mo，无 PR 时也在），故只放在**可选**的 PR 预览平台栈里；不启用 PR 预览就没有这笔成本。启用前主栈需先重部署一次（新增 `PublicSubnet2` 导出供 ALB 跨 2 AZ）。
+> 注 1：共享 ALB 常驻计费（~$16/mo，无 PR 时也在），故只放在**可选**的 PR 预览平台栈里；不启用 PR 预览就没有这笔成本。启用前主栈需先重部署一次（新增 `PublicSubnet2` 导出供 ALB 跨 2 AZ）。
+> 注 2：CDK app 在 `infra/cdk`，本地体验：`cd infra/cdk && npm install && npx cdk synth -c prNumber=1 -c imageUri=... -c runtimeRoleArn=...`。它**不在 pnpm workspace 里**（独立 npm 项目），避免污染共享 TS 配置。
 
