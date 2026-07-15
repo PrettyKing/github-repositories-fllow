@@ -16,6 +16,7 @@ export default {
       const target = origin + url.pathname + url.search;
       const headers = new Headers(request.headers);
       headers.delete("host");
+      headers.delete("content-length"); // 缓冲 body 后由 fetch 重算，避免长度不一致导致 502
       // 注入 Basic Auth（配了才注入；这样浏览器无需弹框，API 仍受保护）
       if (env.BASIC_AUTH_USER && env.BASIC_AUTH_PASSWORD) {
         headers.set(
@@ -25,9 +26,17 @@ export default {
       }
       const init = { method: request.method, headers };
       if (request.method !== "GET" && request.method !== "HEAD") {
-        init.body = request.body;
+        // 缓冲请求体再转发（流式转发在 Pages 子请求里易触发 502）
+        init.body = await request.arrayBuffer();
       }
-      return fetch(target, init);
+      try {
+        return await fetch(target, init);
+      } catch (e) {
+        return new Response(JSON.stringify({ error: "代理到后端失败: " + e.message }), {
+          status: 502,
+          headers: { "content-type": "application/json" },
+        });
+      }
     }
 
     // 非 /api：静态资源（首页 index.html 等）
