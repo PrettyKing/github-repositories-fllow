@@ -142,6 +142,21 @@ Resources:
                 Condition:
                   StringEquals:
                     aws:RequestedRegion: !Ref DeployRegion
+              # Cloud Map 私有 DNS 命名空间底层建/删 Route53 私有托管区；Route53 是全局服务，
+              # 不能受上面的区域条件限制，故单列一条（CreateHostedZone 无法按资源收窄）。
+              - Sid: Route53ForCloudMap
+                Effect: Allow
+                Action:
+                  - route53:CreateHostedZone
+                  - route53:DeleteHostedZone
+                  - route53:GetHostedZone
+                  - route53:ListHostedZones
+                  - route53:ListHostedZonesByName
+                  - route53:ChangeResourceRecordSets
+                  - route53:GetChange
+                  - route53:AssociateVPCWithHostedZone
+                  - route53:DisassociateVPCFromHostedZone
+                Resource: "*"
               # S3 仅限 SAM 托管的构建产物桶
               - Sid: SamArtifactBucket
                 Effect: Allow

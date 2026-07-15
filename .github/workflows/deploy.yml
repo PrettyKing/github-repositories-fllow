@@ -68,6 +68,7 @@ jobs:
             go:
               - 'apps/go-api/**'
               - 'infra/ecs-fargate.yaml'
+              - 'infra/github-oidc.yaml'
 
   # ECS Go 栈：构建 arm64 镜像 → 推 ECR → 部署/更新服务（唯一 DB 访问方）
   # needs deploy：确保主栈（被 ECS 栈 ImportValue 依赖）先就绪，首次部署顺序正确
