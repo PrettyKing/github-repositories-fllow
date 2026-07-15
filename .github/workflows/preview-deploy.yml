@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: preview-pr-${{ github.event.pull_request.number }}
-      url: http://api-pr-${{ github.event.pull_request.number }}.faithcal.xyz:8080
+      url: http://api-pr-${{ github.event.pull_request.number }}.faithcal.xyz
     env:
       PR: ${{ github.event.pull_request.number }}
       SHA: ${{ github.event.pull_request.head.sha }}
@@ -64,6 +64,7 @@ jobs:
             echo "RUNTIME_ROLE_ARN=$(get RuntimeRoleArn)"
             echo "BUILD_PROJECT=$(get BuildProjectName)"
             echo "CF_SECRET_ARN=$(get CloudflareSecretArn)"
+            echo "ALB_DNS=$(get PreviewAlbDnsName)"
           } >> "$GITHUB_ENV"
 
       - name: Build image via CodeBuild (PR code, low-priv)
@@ -88,6 +89,8 @@ jobs:
       - name: Deploy per-PR stack
         run: |
           set -euo pipefail
+          # 打标签供夜间 reconciler 兜底清扫（即便 destroy 偶发失败也能限制成本）
+          EXPIRES=$(date -u -d '+7 days' +%Y-%m-%dT%H:%M:%SZ)
           aws cloudformation deploy \
             --template-file infra/pr-preview-env.yaml \
             --stack-name "${MAIN_STACK}-pr-${PR}" \
@@ -95,42 +98,39 @@ jobs:
             --no-fail-on-empty-changeset \
             --parameter-overrides \
               MainStackName="$MAIN_STACK" PrNumber="$PR" \
-              ImageUri="${ECR_URI}:${TAG}" RuntimeRoleArn="$RUNTIME_ROLE_ARN"
+              ImageUri="${ECR_URI}:${TAG}" RuntimeRoleArn="$RUNTIME_ROLE_ARN" \
+              PreviewZone="$CF_ZONE" \
+            --tags \
+              Environment=preview Repository="$GITHUB_REPOSITORY" \
+              PullRequest="$PR" CommitSha="$SHA" ExpiresAt="$EXPIRES"
           aws ecs wait services-stable \
             --cluster "${MAIN_STACK}-pr-${PR}" --services "${MAIN_STACK}-pr-${PR}"
 
-      - name: Resolve public IP + health check
-        run: |
-          set -euo pipefail
-          TASK=$(aws ecs list-tasks --cluster "${MAIN_STACK}-pr-${PR}" \
-            --service-name "${MAIN_STACK}-pr-${PR}" --query 'taskArns[0]' --output text)
-          ENI=$(aws ecs describe-tasks --cluster "${MAIN_STACK}-pr-${PR}" --tasks "$TASK" \
-            --query 'tasks[0].attachments[0].details[?name==`networkInterfaceId`].value | [0]' --output text)
-          IP=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI" \
-            --query 'NetworkInterfaces[0].Association.PublicIp' --output text)
-          test -n "$IP" && [ "$IP" != "None" ] || { echo "无公网 IP"; exit 1; }
-          echo "IP=$IP" >> "$GITHUB_ENV"
-          echo "健康检查 http://$IP:8080/health"
-          for i in $(seq 1 20); do
-            if curl -fsS -m 5 "http://$IP:8080/health" >/dev/null; then echo "healthy"; exit 0; fi
-            sleep 6
-          done
-          echo "健康检查超时"; exit 1
-
-      - name: Upsert Cloudflare DNS
+      - name: Upsert Cloudflare DNS (CNAME -> 共享 ALB, DNS-only)
         run: |
           set -euo pipefail
           CF_JSON=$(aws secretsmanager get-secret-value --secret-id "$CF_SECRET_ARN" --query SecretString --output text)
           export CF_API_TOKEN=$(echo "$CF_JSON" | jq -r .apiToken)
           export CF_ZONE_ID=$(echo "$CF_JSON" | jq -r .zoneId)
-          bash scripts/cloudflare-upsert-dns.sh A "api-pr-${PR}.${CF_ZONE}" "$IP" false
+          bash scripts/cloudflare-upsert-dns.sh CNAME "api-pr-${PR}.${CF_ZONE}" "$ALB_DNS" false
+
+      - name: Health check via preview URL
+        run: |
+          set -euo pipefail
+          URL="http://api-pr-${PR}.${CF_ZONE}/health"
+          echo "健康检查 $URL"
+          for i in $(seq 1 30); do
+            if curl -fsS -m 5 "$URL" >/dev/null; then echo "healthy"; exit 0; fi
+            sleep 6
+          done
+          echo "健康检查超时（DNS 传播/目标健康未就绪）"; exit 1
 
       - name: Publish summary + PR comment
         uses: actions/github-script@v7
         with:
           script: |
             const pr = Number(process.env.PR);
-            const url = `http://api-pr-${pr}.faithcal.xyz:8080`;
+            const url = `http://api-pr-${pr}.faithcal.xyz`;
             const sha = process.env.SHA;
             const anchor = '<!-- pr-preview-environment -->';
             const body = `${anchor}\n### ✅ PR 预览已部署\n\n| 组件 | 地址 |\n| --- | --- |\n| API | ${url} |\n| 健康 | ${url}/health |\n\nCommit: \`${sha}\``;

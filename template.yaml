@@ -82,6 +82,17 @@ Resources:
       MapPublicIpOnLaunch: true
       Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public" }]
 
+  # 第二个公有子网（AZ-c）：PR 预览的共享内网入口 ALB 需横跨 2 个 AZ 的公有子网。
+  # 主链路不依赖它；只在启用 PR 预览平台栈时被引用。
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${AWS::StackName}-public-2" }]
+
   # 两个私有子网：部署 Lambda + Aurora（跨 2 个 AZ）
   PrivateSubnet1:
     Type: AWS::EC2::Subnet
@@ -128,6 +139,11 @@ Resources:
     Properties:
       RouteTableId: !Ref PublicRouteTable
       SubnetId: !Ref PublicSubnet
+  PublicSubnet2Assoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
 
   # 私有路由表：0.0.0.0/0 -> NAT
   PrivateRouteTable:
@@ -311,6 +327,9 @@ Outputs:
   PublicSubnetId:
     Value: !Ref PublicSubnet
     Export: { Name: !Sub "${AWS::StackName}-PublicSubnet" }
+  PublicSubnet2Id:
+    Value: !Ref PublicSubnet2
+    Export: { Name: !Sub "${AWS::StackName}-PublicSubnet2" }
   PrivateSubnet1Id:
     Value: !Ref PrivateSubnet1
     Export: { Name: !Sub "${AWS::StackName}-PrivateSubnet1" }

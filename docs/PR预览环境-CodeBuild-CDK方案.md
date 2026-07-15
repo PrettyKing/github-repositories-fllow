@@ -318,7 +318,9 @@ PR 中的代码是不可信输入，尤其需要避免以下模式：
 2. ✅ 正式接入 PR 事件并正确读取字段。→ `pull_request_target`（opened/reopened/synchronize / closed），读 `pull_request.number`、`head.sha`、`head.repo.full_name`。
 3. ✅ CodeBuild 完成等待、健康检查、URL 展示。→ 轮询 `batch-get-builds`；curl `IP:8080/health`；写 **Actions Summary + PR 固定评论(锚点)+ 动态 GitHub Environment**。
 4. ✅ 删除失败可见，不吞 `DELETE_FAILED`。→ destroy 仅把「栈本不存在」当幂等成功，其余非成功状态 `::error::` 并让工作流失败。
-5. ⚠️ 部署/销毁并发竞态。→ 已用**同一 concurrency 组 `preview-pr-<n>` 串行** + 部署前 **open-guard**；**定时孤儿清扫(reconciler)尚未做**。
-6. ⬜ 动态公网 IP → 共享 ALB / 稳定入口（wildcard DNS+证书）。当前仍是每 PR 任务公网 IP + Cloudflare A 记录（`http://api-pr-<n>.faithcal.xyz:8080`）。
+5. ✅ 部署/销毁并发竞态。→ 同一 concurrency 组 `preview-pr-<n>` 串行 + 部署前 open-guard + **`preview-reconcile.yml` 每晚孤儿清扫**（按 `Environment=preview` 标签 + PR 状态/`ExpiresAt`）。
+6. ✅ 动态公网 IP → 稳定入口。→ **长期共享 ALB**（`infra/pr-preview.yaml` 内，Host 路由）；每 PR 任务改**私有子网+目标组+Host 监听规则**；Cloudflare **DNS-only CNAME → ALB**，`http://api-pr-<n>.faithcal.xyz`（无端口，任务 IP 变化被目标组屏蔽）。仍为 HTTP（免证书）；要 HTTPS 需给 ALB 挂 ACM。
 7. ⬜ 每 PR CloudFormation 模板迁 CDK Construct（建议最后再评估，非必须）。
+
+> 注：共享 ALB 常驻计费（~$16/mo，无 PR 时也在），故只放在**可选**的 PR 预览平台栈里；不启用 PR 预览就没有这笔成本。启用前主栈需先重部署一次（新增 `PublicSubnet2` 导出供 ALB 跨 2 AZ）。
 

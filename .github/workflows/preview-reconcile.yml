@@ -1,0 +1,81 @@
+name: PR Preview Reconcile
+
+# 兜底清扫：即使 destroy 工作流/Webhook 偶发失败，夜间也扫描所有预览栈，
+# 删除「PR 已非 open」或「已过 ExpiresAt」的孤儿环境，限制成本泄漏（§并发·最终一致性）。
+on:
+  schedule:
+    - cron: "0 18 * * *" # 每天 UTC 18:00（东京 03:00）
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-1
+  MAIN_STACK: github-repositories-fllow
+  BOOTSTRAP_STACK: github-repositories-fllow-pr-preview
+  CF_ZONE: faithcal.xyz
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PR_PREVIEW_OPS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Sweep orphaned preview stacks
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          CF_SECRET_ARN=$(aws cloudformation describe-stacks --stack-name "$BOOTSTRAP_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='CloudflareSecretArn'].OutputValue" --output text)
+          CF_JSON=$(aws secretsmanager get-secret-value --secret-id "$CF_SECRET_ARN" --query SecretString --output text)
+          CF_API_TOKEN=$(echo "$CF_JSON" | jq -r .apiToken)
+          CF_ZONE_ID=$(echo "$CF_JSON" | jq -r .zoneId)
+          CF_API="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records"
+
+          # 只匹配 <stack>-pr-<数字>（排除 bootstrap 的 -pr-preview 与 -ecs 等）
+          STACKS=$(aws cloudformation list-stacks \
+            --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE UPDATE_ROLLBACK_COMPLETE ROLLBACK_COMPLETE CREATE_FAILED \
+            --query "StackSummaries[].StackName" --output text | tr '\t' '\n' \
+            | grep -E "^${MAIN_STACK}-pr-[0-9]+$" || true)
+
+          now=$(date -u +%s)
+          failed=0
+          for STACK in $STACKS; do
+            PR="${STACK##*-pr-}"
+            state=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json state -q .state 2>/dev/null || echo MISSING)
+            expires=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+              --query "Stacks[0].Tags[?Key=='ExpiresAt'].Value | [0]" --output text 2>/dev/null || echo "")
+            exp=0
+            if [ -n "$expires" ] && [ "$expires" != "None" ]; then exp=$(date -u -d "$expires" +%s 2>/dev/null || echo 0); fi
+
+            stale=false
+            [ "$state" != "OPEN" ] && stale=true
+            { [ "$exp" != "0" ] && [ "$now" -gt "$exp" ]; } && stale=true
+
+            if [ "$stale" != true ]; then
+              echo "✅ 保留 $STACK (PR #$PR open, 未过期)"; continue
+            fi
+
+            echo "🧹 清理 $STACK (PR #$PR state=$state expires=${expires:-none})"
+            aws cloudformation delete-stack --stack-name "$STACK"
+            if ! aws cloudformation wait stack-delete-complete --stack-name "$STACK" 2>/dev/null; then
+              st=$(aws cloudformation describe-stacks --stack-name "$STACK" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo GONE)
+              if [ "$st" != "GONE" ]; then echo "::error::$STACK 删除失败 status=$st"; failed=1; continue; fi
+            fi
+            NAME="api-pr-${PR}.${CF_ZONE}"
+            REC=$(curl -fsS -H "Authorization: Bearer ${CF_API_TOKEN}" "${CF_API}?type=CNAME&name=${NAME}" | jq -r '.result[0].id // empty')
+            if [ -n "$REC" ]; then
+              curl -fsS -X DELETE -H "Authorization: Bearer ${CF_API_TOKEN}" "${CF_API}/${REC}" >/dev/null && echo "DNS ${NAME} 删除"
+            fi
+          done
+          echo "reconcile 完成"
+          exit $failed

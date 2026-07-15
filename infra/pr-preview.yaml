@@ -136,6 +136,11 @@ Resources:
                   - codebuild:StartBuild
                   - codebuild:BatchGetBuilds
                 Resource: !GetAtt PrPreviewBuildProject.Arn
+              # ListStacks 不能按资源收窄，单列一条放行（reconciler 枚举预览栈用）
+              - Sid: ListStacks
+                Effect: Allow
+                Action: cloudformation:ListStacks
+                Resource: "*"
               - Sid: DeployPerPrStacks
                 Effect: Allow
                 Action:
@@ -218,6 +223,52 @@ Resources:
           - { Name: PREVIEW_ECR_URI, Value: !GetAtt PreviewEcrRepo.RepositoryUri }
       TimeoutInMinutes: 20
 
+  # ──────────────────────────── 共享预览入口 ALB（长期存在，被所有 PR 复用）────────────────────────────
+  # 稳定入口：任务 IP 变化被 ALB 目标组屏蔽；Host 路由 api-pr-<n> → 各 PR 目标组。
+  # HTTP:80，Cloudflare 用 DNS-only CNAME 指过来（http://api-pr-<n>.<zone>，无端口、免证书）。
+  PreviewAlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Shared preview ALB - allow 80 from internet (Cloudflare)
+      VpcId: !ImportValue
+        Fn::Sub: "${MainStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub "${MainStackName}-preview-alb-sg" }]
+
+  PreviewAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${MainStackName}-preview-alb"
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups: [!Ref PreviewAlbSecurityGroup]
+      Subnets:
+        - !ImportValue
+          Fn::Sub: "${MainStackName}-PublicSubnet"
+        - !ImportValue
+          Fn::Sub: "${MainStackName}-PublicSubnet2"
+
+  # 默认 404：未匹配任何 PR host 的请求直接拒
+  PreviewAlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref PreviewAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "404"
+            ContentType: text/plain
+            MessageBody: no preview for this host
+
 Outputs:
   OpsRoleArn:
     Description: 填到 GitHub Secret AWS_PR_PREVIEW_OPS_ROLE_ARN（preview-deploy/destroy 假设它）
@@ -232,3 +283,12 @@ Outputs:
     Value: !Ref CloudflareSecret
   PreviewEcrUri:
     Value: !GetAtt PreviewEcrRepo.RepositoryUri
+  PreviewAlbDnsName:
+    Description: Cloudflare 把 api-pr-<n> 用 DNS-only CNAME 指向这个 ALB 域名
+    Value: !GetAtt PreviewAlb.DNSName
+  PreviewAlbListenerArn:
+    Value: !Ref PreviewAlbListener
+    Export: { Name: !Sub "${MainStackName}-PreviewAlbListenerArn" }
+  PreviewAlbSecurityGroupId:
+    Value: !Ref PreviewAlbSecurityGroup
+    Export: { Name: !Sub "${MainStackName}-PreviewAlbSecurityGroup" }

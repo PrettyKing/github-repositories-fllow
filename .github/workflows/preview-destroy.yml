@@ -68,7 +68,7 @@ jobs:
           CF_ZONE_ID=$(echo "$CF_JSON" | jq -r .zoneId)
           NAME="api-pr-${PR}.${CF_ZONE}"
           API="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records"
-          REC=$(curl -fsS -H "Authorization: Bearer ${CF_API_TOKEN}" "${API}?type=A&name=${NAME}" | jq -r '.result[0].id // empty')
+          REC=$(curl -fsS -H "Authorization: Bearer ${CF_API_TOKEN}" "${API}?type=CNAME&name=${NAME}" | jq -r '.result[0].id // empty')
           if [ -n "$REC" ]; then
             curl -fsS -X DELETE -H "Authorization: Bearer ${CF_API_TOKEN}" "${API}/${REC}" >/dev/null
             echo "DNS ${NAME} 已删除"
