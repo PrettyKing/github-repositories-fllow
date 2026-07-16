@@ -205,7 +205,9 @@ func (r *GitHubUserRepository) Stats(ctx context.Context) (model.Stats, error) {
 		return model.Stats{}, fmt.Errorf("aggregate users: %w", err)
 	}
 
-	if err := r.db.QueryRow(ctx, `SELECT count(*)::int FROM github_repos`).Scan(&stats.Repos); err != nil {
+	if err := r.db.QueryRow(ctx,
+		`SELECT count(*)::int, coalesce(sum(stargazers_count), 0)::int FROM github_repos`,
+	).Scan(&stats.Repos, &stats.TotalStars); err != nil {
 		return model.Stats{}, fmt.Errorf("count repos: %w", err)
 	}
 

@@ -32,6 +32,7 @@ export default function StatsPanel({ stats, loading }: StatsPanelProps) {
   const s = stats ?? {
     users: 0,
     repos: 0,
+    totalStars: 0,
     totalFollowers: 0,
     totalPublicRepos: 0,
     topUsers: [],
@@ -41,6 +42,7 @@ export default function StatsPanel({ stats, loading }: StatsPanelProps) {
   const numberCards = [
     { label: "账户数", value: s.users },
     { label: "仓库数", value: s.repos },
+    { label: "总 Stars", value: s.totalStars },
     { label: "总 Followers", value: s.totalFollowers },
     { label: "总 Public Repos", value: s.totalPublicRepos },
   ] as const;
@@ -48,7 +50,7 @@ export default function StatsPanel({ stats, loading }: StatsPanelProps) {
   return (
     <div className="mb-6">
       {/* 关键数字卡片 */}
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 mb-4">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-5 mb-4">
         {numberCards.map((card) => (
           <Card key={card.label} size="sm">
             <CardContent>

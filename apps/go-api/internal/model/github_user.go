@@ -40,6 +40,7 @@ type GitHubRepo struct {
 type Stats struct {
 	Users            int        `json:"users"`
 	Repos            int        `json:"repos"`
+	TotalStars       int        `json:"totalStars"`
 	TotalFollowers   int        `json:"totalFollowers"`
 	TotalPublicRepos int        `json:"totalPublicRepos"`
 	TopUsers         []TopUser  `json:"topUsers"`
