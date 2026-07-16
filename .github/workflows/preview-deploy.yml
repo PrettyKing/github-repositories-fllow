@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: preview-pr-${{ github.event.pull_request.number }}
-      url: http://api-pr-${{ github.event.pull_request.number }}.faithcal.xyz
+      url: https://pr-${{ github.event.pull_request.number }}.faithcal.xyz
     env:
       PR: ${{ github.event.pull_request.number }}
       SHA: ${{ github.event.pull_request.head.sha }}
@@ -44,6 +44,10 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           path: _pr
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
 
       - uses: actions/setup-node@v4
         with:
@@ -127,15 +131,94 @@ jobs:
           done
           echo "健康检查超时（DNS 传播/目标健康未就绪）"; exit 1
 
+      # ─────────────────── 前端预览：per-PR Pages 项目 + 自定义域名 ───────────────────
+      # 每 PR 一个独立 Pages 项目（自定义域名只能绑生产部署），前端 worker 同源代理到
+      # 该 PR 的后端 api-pr-<n>；Basic Auth 走 Pages 环境变量（不入构建产物）。
+      - name: Read Basic Auth（注入 Pages 同源代理）
+        run: |
+          set -euo pipefail
+          AUTH_ARN=$(aws cloudformation describe-stacks --stack-name "$MAIN_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='AuthSecretArn'].OutputValue" --output text)
+          AUTH_JSON=$(aws secretsmanager get-secret-value --secret-id "$AUTH_ARN" --query SecretString --output text)
+          U=$(echo "$AUTH_JSON" | jq -r .username); P=$(echo "$AUTH_JSON" | jq -r .password)
+          echo "::add-mask::$U"; echo "::add-mask::$P"
+          echo "BASIC_AUTH_USER=$U" >> "$GITHUB_ENV"
+          echo "BASIC_AUTH_PASSWORD=$P" >> "$GITHUB_ENV"
+
+      - name: Configure per-PR Pages project（env vars 须先于 deploy）
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          PROJECT="${MAIN_STACK}-pr-${PR}-web"
+          echo "WEB_PROJECT=$PROJECT" >> "$GITHUB_ENV"
+          API_ORIGIN="http://api-pr-${PR}.${CF_ZONE}"
+          BASE="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects"
+          CFG=$(jq -n --arg api "$API_ORIGIN" --arg u "$BASIC_AUTH_USER" --arg p "$BASIC_AUTH_PASSWORD" '{
+            deployment_configs: { production: { env_vars: {
+              API_ORIGIN: { value: $api },
+              BASIC_AUTH_USER: { value: $u },
+              BASIC_AUTH_PASSWORD: { value: $p }
+            }}}}')
+          if curl -fsS -H "Authorization: Bearer $CF_API_TOKEN" "${BASE}/${PROJECT}" >/dev/null 2>&1; then
+            curl -fsS -X PATCH -H "Authorization: Bearer $CF_API_TOKEN" -H "content-type: application/json" \
+              "${BASE}/${PROJECT}" --data "$CFG" >/dev/null
+          else
+            curl -fsS -X POST -H "Authorization: Bearer $CF_API_TOKEN" -H "content-type: application/json" \
+              "$BASE" --data "$(echo "$CFG" | jq --arg n "$PROJECT" '. + {name:$n, production_branch:"main"}')" >/dev/null
+          fi
+          echo "Pages 项目 $PROJECT 已就绪（API_ORIGIN=$API_ORIGIN）"
+
+      - name: Build frontend（PR 代码，接该 PR 后端）
+        working-directory: _pr
+        run: |
+          set -euo pipefail
+          pnpm install --frozen-lockfile
+          pnpm --filter web build
+
+      - name: Deploy frontend to Pages（该项目生产部署）
+        working-directory: _pr/apps/web
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --yes wrangler@3 pages deploy out --project-name="$WEB_PROJECT" --branch=main
+
+      - name: Attach custom domain pr-<n>.faithcal.xyz
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          DOMAIN="pr-${PR}.${CF_ZONE}"
+          echo "WEB_URL=https://${DOMAIN}" >> "$GITHUB_ENV"
+          BASE="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${WEB_PROJECT}/domains"
+          # 幂等：已挂则接口返回非 2xx，忽略即可
+          curl -fsS -X POST -H "Authorization: Bearer $CF_API_TOKEN" -H "content-type: application/json" \
+            "$BASE" --data "$(jq -n --arg n "$DOMAIN" '{name:$n}')" >/dev/null 2>&1 \
+            && echo "自定义域名 $DOMAIN 已提交" || echo "自定义域名已存在（ok）"
+
+      - name: Health check frontend
+        run: |
+          set -euo pipefail
+          echo "前端健康检查 $WEB_URL（自定义域名证书签发可能需 1-2 分钟）"
+          for i in $(seq 1 40); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 8 "$WEB_URL" || true)
+            if [ "$code" = "200" ]; then echo "frontend healthy"; exit 0; fi
+            echo "  第 $i 次: HTTP $code"; sleep 6
+          done
+          echo "前端健康检查超时（证书/DNS 未就绪，可稍后手动访问）"; exit 1
+
       - name: Publish summary + PR comment
         uses: actions/github-script@v7
         with:
           script: |
             const pr = Number(process.env.PR);
-            const url = `http://api-pr-${pr}.faithcal.xyz`;
+            const web = `https://pr-${pr}.faithcal.xyz`;
+            const api = `http://api-pr-${pr}.faithcal.xyz`;
             const sha = process.env.SHA;
             const anchor = '<!-- pr-preview-environment -->';
-            const body = `${anchor}\n### ✅ PR 预览已部署\n\n| 组件 | 地址 |\n| --- | --- |\n| API | ${url} |\n| 健康 | ${url}/health |\n\nCommit: \`${sha}\``;
+            const body = `${anchor}\n### ✅ PR 预览已部署\n\n| 组件 | 地址 |\n| --- | --- |\n| 🌐 前端预览 | ${web} |\n| API | ${api} |\n| 健康 | ${api}/health |\n\nCommit: \`${sha}\``;
             core.summary.addRaw(body).write();
             const { owner, repo } = context.repo;
             const list = await github.rest.issues.listComments({ owner, repo, issue_number: pr });

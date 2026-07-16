@@ -150,6 +150,17 @@ Resources:
                   - ecr:CompleteLayerUpload
                   - ecr:PutImage
                 Resource: "*"
+              # CDK(CliCredentialsStackSynthesizer)用自身凭据把模板上传到 cdk 资产桶
+              - Sid: CdkAssetsBucket
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::cdk-hnb659fds-assets-${AWS::AccountId}-${DeployRegion}"
+                  - !Sub "arn:aws:s3:::cdk-hnb659fds-assets-${AWS::AccountId}-${DeployRegion}/*"
               # ListStacks 不能按资源收窄，单列一条放行（reconciler 枚举预览栈用）
               - Sid: ListStacks
                 Effect: Allow
@@ -178,6 +189,9 @@ Resources:
                   - logs:DeleteLogGroup
                   - logs:PutRetentionPolicy
                   - logs:DescribeLogGroups
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - logs:ListTagsForResource
                   - ecr:DescribeRepositories
                   - ecr:DescribeImages
                 Resource: "*"
@@ -188,6 +202,16 @@ Resources:
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Ref CloudflareSecret
+              # 前端预览需读主栈输出拿 AuthSecret ARN（主栈名不匹配 -pr-* 通配，单列）
+              - Sid: ReadMainStackOutputs
+                Effect: Allow
+                Action: cloudformation:DescribeStacks
+                Resource: !Sub "arn:aws:cloudformation:${DeployRegion}:${AWS::AccountId}:stack/${MainStackName}/*"
+              # 前端预览把同一套 Basic Auth 注入 Pages 环境变量（同源代理鉴权），需读 Auth 密钥
+              - Sid: ReadAuthSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${DeployRegion}:${AWS::AccountId}:secret:AuthSecret-*"
               - Sid: PassRuntimeRoleToEcs
                 Effect: Allow
                 Action: iam:PassRole
