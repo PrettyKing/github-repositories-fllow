@@ -184,19 +184,26 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: npx --yes wrangler@3 pages deploy out --project-name="$WEB_PROJECT" --branch=main
 
-      - name: Attach custom domain pr-<n>.faithcal.xyz
+      - name: Attach custom domain + DNS（pr-<n>.faithcal.xyz）
         env:
-          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # Pages 令牌只有 Pages 编辑权，用于向项目注册自定义域名
+          CF_PAGES_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
           DOMAIN="pr-${PR}.${CF_ZONE}"
           echo "WEB_URL=https://${DOMAIN}" >> "$GITHUB_ENV"
-          BASE="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${WEB_PROJECT}/domains"
-          # 幂等：已挂则接口返回非 2xx，忽略即可
-          curl -fsS -X POST -H "Authorization: Bearer $CF_API_TOKEN" -H "content-type: application/json" \
-            "$BASE" --data "$(jq -n --arg n "$DOMAIN" '{name:$n}')" >/dev/null 2>&1 \
-            && echo "自定义域名 $DOMAIN 已提交" || echo "自定义域名已存在（ok）"
+          # 1) Pages 侧注册自定义域名（识别 Host → 该项目 + 签发证书）
+          PBASE="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${WEB_PROJECT}/domains"
+          curl -fsS -X POST -H "Authorization: Bearer $CF_PAGES_TOKEN" -H "content-type: application/json" \
+            "$PBASE" --data "$(jq -n --arg n "$DOMAIN" '{name:$n}')" >/dev/null 2>&1 \
+            && echo "自定义域名 $DOMAIN 已注册" || echo "自定义域名已存在（ok）"
+          # 2) 写 proxied CNAME → 项目 pages.dev（Pages 令牌无 DNS 编辑权，故用 DNS 令牌单独写）
+          #    proxied=true：Cloudflare 边缘终止 SSL 并按 Host 路由到 Pages 项目
+          CF_JSON=$(aws secretsmanager get-secret-value --secret-id "$CF_SECRET_ARN" --query SecretString --output text)
+          export CF_API_TOKEN=$(echo "$CF_JSON" | jq -r .apiToken)
+          export CF_ZONE_ID=$(echo "$CF_JSON" | jq -r .zoneId)
+          bash scripts/cloudflare-upsert-dns.sh CNAME "$DOMAIN" "${WEB_PROJECT}.pages.dev" true
 
       - name: Health check frontend
         run: |

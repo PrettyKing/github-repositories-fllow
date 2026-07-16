@@ -67,15 +67,17 @@ jobs:
           CF_JSON=$(aws secretsmanager get-secret-value --secret-id "$CF_SECRET_ARN" --query SecretString --output text)
           CF_API_TOKEN=$(echo "$CF_JSON" | jq -r .apiToken)
           CF_ZONE_ID=$(echo "$CF_JSON" | jq -r .zoneId)
-          NAME="api-pr-${PR}.${CF_ZONE}"
           API="https://api.cloudflare.com/client/v4/zones/${CF_ZONE_ID}/dns_records"
-          REC=$(curl -fsS -H "Authorization: Bearer ${CF_API_TOKEN}" "${API}?type=CNAME&name=${NAME}" | jq -r '.result[0].id // empty')
-          if [ -n "$REC" ]; then
-            curl -fsS -X DELETE -H "Authorization: Bearer ${CF_API_TOKEN}" "${API}/${REC}" >/dev/null
-            echo "DNS ${NAME} 已删除"
-          else
-            echo "无 DNS 记录（ok）"
-          fi
+          # 后端 api-pr-<n>（DNS-only）+ 前端 pr-<n>（proxied，指向 Pages）两条都清
+          for NAME in "api-pr-${PR}.${CF_ZONE}" "pr-${PR}.${CF_ZONE}"; do
+            REC=$(curl -fsS -H "Authorization: Bearer ${CF_API_TOKEN}" "${API}?type=CNAME&name=${NAME}" | jq -r '.result[0].id // empty')
+            if [ -n "$REC" ]; then
+              curl -fsS -X DELETE -H "Authorization: Bearer ${CF_API_TOKEN}" "${API}/${REC}" >/dev/null
+              echo "DNS ${NAME} 已删除"
+            else
+              echo "无 DNS 记录 ${NAME}（ok）"
+            fi
+          done
 
       - name: Delete per-PR Pages project（前端预览，含自定义域名）
         env:
