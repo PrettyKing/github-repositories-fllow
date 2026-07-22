@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Cognito-authenticated AWS-hosted AI Ops administrator console.
+
+Parameters:
+  AdminEmail: { Type: String, Default: "", Description: Optional initial administrator email. }
+  RuntimeBoundaryName: { Type: String, Default: github-repositories-fllow-lambda-boundary }
+  IncidentTableName: { Type: String }
+  TestTopicArn: { Type: String }
+  AllowedDlqArns: { Type: CommaDelimitedList }
+  AllowedAlarms: { Type: CommaDelimitedList }
+  AlarmPrefixes: { Type: CommaDelimitedList, Default: "github-repositories-fllow-,prod-api-" }
+  AllowedLogGroups: { Type: CommaDelimitedList }
+  AllowedCanaries: { Type: CommaDelimitedList, Default: prod-api-journey }
+  AllowedDeploymentGroups: { Type: CommaDelimitedList }
+
+Conditions:
+  HasAdminEmail: !Not [!Equals [!Ref AdminEmail, ""]]
+
+Resources:
+  ConsoleBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption: { ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }] }
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      VersioningConfiguration: { Status: Enabled }
+
+  ConsoleOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig: { Name: !Sub "${AWS::StackName}-oac", OriginAccessControlOriginType: s3, SigningBehavior: always, SigningProtocol: sigv4 }
+
+  ConsoleDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2and3
+        DefaultRootObject: index.html
+        Origins:
+          - Id: console-s3
+            DomainName: !GetAtt ConsoleBucket.RegionalDomainName
+            OriginAccessControlId: !Ref ConsoleOriginAccessControl
+            S3OriginConfig: { OriginAccessIdentity: "" }
+        DefaultCacheBehavior:
+          TargetOriginId: console-s3
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          Compress: true
+          ForwardedValues: { QueryString: false, Cookies: { Forward: none } }
+        CustomErrorResponses:
+          - { ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html }
+          - { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html }
+        ViewerCertificate: { CloudFrontDefaultCertificate: true }
+
+  ConsoleBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConsoleBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${ConsoleBucket.Arn}/*"
+            Condition: { StringEquals: { "AWS:SourceArn": !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${ConsoleDistribution}" } }
+
+  AdminUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-admins"
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig: { AllowAdminCreateUserOnly: true }
+      MfaConfiguration: OPTIONAL
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies: { PasswordPolicy: { MinimumLength: 12, RequireLowercase: true, RequireUppercase: true, RequireNumbers: true, RequireSymbols: true, TemporaryPasswordValidityDays: 3 } }
+
+  AdminUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties: { Domain: !Sub "github-fllow-aiops-${AWS::AccountId}", UserPoolId: !Ref AdminUserPool }
+
+  AdminUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: aiops-console
+      UserPoolId: !Ref AdminUserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: [!Sub "https://${ConsoleDistribution.DomainName}/"]
+      LogoutURLs: [!Sub "https://${ConsoleDistribution.DomainName}/"]
+
+  InitialAdmin:
+    Type: AWS::Cognito::UserPoolUser
+    Condition: HasAdminEmail
+    Properties:
+      UserPoolId: !Ref AdminUserPool
+      Username: !Ref AdminEmail
+      DesiredDeliveryMediums: [EMAIL]
+      ForceAliasCreation: false
+      UserAttributes: [{ Name: email, Value: !Ref AdminEmail }, { Name: email_verified, Value: "true" }]
+
+  ConsoleApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: [!Sub "https://${ConsoleDistribution.DomainName}"]
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, POST, OPTIONS]
+
+  ConsoleAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref ConsoleApi
+      AuthorizerType: JWT
+      IdentitySource: [$request.header.Authorization]
+      Name: cognito-admins
+      JwtConfiguration: { Audience: [!Ref AdminUserPoolClient], Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${AdminUserPool}" }
+
+  ConsoleApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${RuntimeBoundaryName}"
+      AssumeRolePolicyDocument: { Version: "2012-10-17", Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }] }
+      ManagedPolicyArns: [!Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"]
+      Policies:
+        - PolicyName: console-read-and-safe-test
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - { Effect: Allow, Action: [cloudwatch:DescribeAlarms, logs:FilterLogEvents, synthetics:GetCanaryRuns, sqs:GetQueueAttributes, codedeploy:ListDeployments], Resource: "*" }
+              - { Effect: Allow, Action: [dynamodb:GetItem, dynamodb:Scan], Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${IncidentTableName}" }
+              - { Effect: Allow, Action: sns:Publish, Resource: !Ref TestTopicArn }
+
+  ConsoleApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../apps/aiops-agent/dist
+      Handler: console.handler
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      Timeout: 30
+      Role: !GetAtt ConsoleApiRole.Arn
+      Environment:
+        Variables:
+          INCIDENT_TABLE: !Ref IncidentTableName
+          TEST_TOPIC_ARN: !Ref TestTopicArn
+          ALLOWED_DLQ_ARNS: !Join [",", !Ref AllowedDlqArns]
+          ALLOWED_ALARMS: !Join [",", !Ref AllowedAlarms]
+          ALARM_PREFIXES: !Join [",", !Ref AlarmPrefixes]
+          ALLOWED_LOG_GROUPS: !Join [",", !Ref AllowedLogGroups]
+          ALLOWED_CANARIES: !Join [",", !Ref AllowedCanaries]
+          ALLOWED_DEPLOYMENT_GROUPS: !Join [",", !Ref AllowedDeploymentGroups]
+
+  ConsoleIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties: { ApiId: !Ref ConsoleApi, IntegrationType: AWS_PROXY, IntegrationUri: !GetAtt ConsoleApiFunction.Arn, PayloadFormatVersion: "2.0" }
+  ConsoleRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref ConsoleApi, RouteKey: "$default", Target: !Sub "integrations/${ConsoleIntegration}", AuthorizationType: JWT, AuthorizerId: !Ref ConsoleAuthorizer }
+  ConsoleStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties: { ApiId: !Ref ConsoleApi, StageName: "$default", AutoDeploy: true }
+  ConsoleInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties: { Action: lambda:InvokeFunction, FunctionName: !Ref ConsoleApiFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ConsoleApi}/*" }
+
+Outputs:
+  ConsoleUrl: { Value: !Sub "https://${ConsoleDistribution.DomainName}/" }
+  ConsoleBucketName: { Value: !Ref ConsoleBucket }
+  DistributionId: { Value: !Ref ConsoleDistribution }
+  ApiUrl: { Value: !Sub "https://${ConsoleApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}" }
+  CognitoDomain: { Value: !Sub "github-fllow-aiops-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com" }
+  CognitoClientId: { Value: !Ref AdminUserPoolClient }
+  UserPoolId: { Value: !Ref AdminUserPool }

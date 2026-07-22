@@ -62,7 +62,7 @@
 | 9 | observability-synthetics | Synthetics 深浅巡检、CloudWatch Alarm/Dashboard、SNS 通知 | 3,4、当前 ECS 架构 | 🟡 实现完成，待 AWS 演练 |
 | 10 | event-driven-sns-sqs | GitHub 同步领域事件、SNS/SQS、Consumer、DLQ/redrive | 4,6,7；可复用 9 的通知 | 🟡 实现完成，待 AWS 演练 |
 | 11 | api-canary-release | Lambda Alias + CodeDeploy 10% 灰度、Hook、自动回滚 | 3,4,9 | 🟡 实现完成，待 AWS 演练 |
-| 12 | aiops-agent | Bedrock Agent、告警诊断、Incident、人审恢复 | 4,9,10,11 | 🟡 后端核心完成，UI/云端验收待办 |
+| 12 | aiops-agent | Bedrock Agent、Incident、人审恢复、独立 React Console | 4,9,10,11 | 🟡 Agent/Console 完成，待模型接入与云端演练 |
 | 13 | local-aiops-mcp | 本地 MCP Server 调用受限 AWS 运维工具 | 12 | 🟡 实现完成，待真实 Client 验收 |
 
 **推荐执行顺序**：9 → 10 → 11 → 12 → 13。9 与 10 的应用开发可并行，但两者都必须先完成 `infra/github-oidc.yaml` 的 bootstrap 权限扩展；11 依赖 9 的告警，12 依赖 9~11 的可观测证据与恢复动作。
@@ -75,3 +75,4 @@
 - API 灰度仅覆盖 Hono Lambda，策略为 `Canary10Percent10Minutes`；ECS 蓝绿发布不在本期。
 - AWS AI Ops 采用 Bedrock Agent + Lambda Action Group；默认只读，redrive/rollback 必须人工审批并由独立角色执行。
 - 本地 MCP 为选做，使用 stdio + AWS SSO/Profile，写工具只创建云端审批申请。
+- AI Ops Console 为独立 React + Tailwind 应用，生产使用 CloudFront/S3 + Cognito/JWT；本地 Mock 模式不访问 AWS。它不属于 MCP，MCP 不提供 Web 页面或 HTTP 端口。

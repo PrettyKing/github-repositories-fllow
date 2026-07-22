@@ -1,0 +1,55 @@
+name: Deploy AI Ops Admin Console
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["apps/aiops-agent/**", "apps/aiops-console/**", "infra/aiops-console.yaml", ".github/workflows/deploy-aiops-console.yml"]
+permissions: { id-token: write, contents: read }
+env:
+  AWS_REGION: ap-northeast-1
+  MAIN_STACK: github-repositories-fllow
+  MESSAGING_STACK: github-repositories-fllow-messaging
+  AIOPS_STACK: github-repositories-fllow-aiops
+  CONSOLE_STACK: github-repositories-fllow-aiops-console
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 11.9.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter aiops-agent build
+      - run: pnpm --filter aiops-console build
+      - uses: aws-actions/configure-aws-credentials@v4
+        with: { role-to-assume: "${{ secrets.AWS_DEPLOY_ROLE_ARN }}", aws-region: "${{ env.AWS_REGION }}" }
+      - uses: aws-actions/setup-sam@v2
+        with: { use-installer: true }
+      - name: Deploy authenticated console
+        env: { ADMIN_EMAIL: "${{ secrets.AIOPS_ADMIN_EMAIL }}" }
+        run: |
+          set -euo pipefail
+          TABLE=$(aws cloudformation describe-stacks --stack-name "$AIOPS_STACK" --query "Stacks[0].Outputs[?OutputKey=='IncidentTableName'].OutputValue|[0]" --output text)
+          TOPIC=$(aws cloudformation describe-stacks --stack-name "$MESSAGING_STACK" --query "Stacks[0].Outputs[?OutputKey=='TopicArn'].OutputValue|[0]" --output text)
+          DLQ=$(aws cloudformation describe-stacks --stack-name "$MESSAGING_STACK" --query "Stacks[0].Outputs[?OutputKey=='DLQArn'].OutputValue|[0]" --output text)
+          API_FN=$(aws cloudformation describe-stack-resources --stack-name "$MAIN_STACK" --query "StackResources[?LogicalResourceId=='ApiFunction'].PhysicalResourceId|[0]" --output text)
+          APP=$(aws cloudformation describe-stack-resources --stack-name "$MAIN_STACK" --query "StackResources[?ResourceType=='AWS::CodeDeploy::Application'].PhysicalResourceId|[0]" --output text)
+          GROUP=$(aws cloudformation describe-stack-resources --stack-name "$MAIN_STACK" --query "StackResources[?ResourceType=='AWS::CodeDeploy::DeploymentGroup'].PhysicalResourceId|[0]" --output text)
+          sam deploy --template-file infra/aiops-console.yaml --stack-name "$CONSOLE_STACK" --resolve-s3 \
+            --capabilities CAPABILITY_NAMED_IAM --no-confirm-changeset --no-fail-on-empty-changeset \
+            --parameter-overrides AdminEmail="$ADMIN_EMAIL" IncidentTableName="$TABLE" TestTopicArn="$TOPIC" \
+              AllowedDlqArns="$DLQ" AllowedAlarms="${MAIN_STACK}-api-5xx,${MAIN_STACK}-api-alias-errors" \
+              AllowedLogGroups="/aws/lambda/${API_FN},/aws/lambda/${MAIN_STACK}-event-consumer" \
+              AllowedDeploymentGroups="${APP}/${GROUP}"
+      - name: Publish console assets
+        run: |
+          set -euo pipefail
+          outputs() { aws cloudformation describe-stacks --stack-name "$CONSOLE_STACK" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue|[0]" --output text; }
+          BUCKET=$(outputs ConsoleBucketName); DIST=$(outputs DistributionId); API=$(outputs ApiUrl); DOMAIN=$(outputs CognitoDomain); CLIENT=$(outputs CognitoClientId); URL=$(outputs ConsoleUrl)
+          sed -e "s|__API_URL__|$API|g" -e "s|__COGNITO_DOMAIN__|$DOMAIN|g" -e "s|__COGNITO_CLIENT_ID__|$CLIENT|g" -e "s|__CONSOLE_URL__|$URL|g" apps/aiops-console/config.example.js > apps/aiops-console/dist/config.js
+          aws s3 sync apps/aiops-console/dist "s3://$BUCKET" --delete --cache-control "no-store"
+          aws cloudfront create-invalidation --distribution-id "$DIST" --paths "/*"
+          echo "### AI Ops Console" >> "$GITHUB_STEP_SUMMARY"
+          echo "$URL" >> "$GITHUB_STEP_SUMMARY"

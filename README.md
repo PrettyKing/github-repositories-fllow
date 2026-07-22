@@ -43,6 +43,14 @@ pnpm run dev
 Open [http://localhost:5173](http://localhost:5173) in your browser to see the web application.
 The API is running at [http://localhost:3000](http://localhost:3000).
 
+AI Ops Console 可独立启动：
+
+```bash
+pnpm --filter aiops-console dev
+```
+
+打开 `http://127.0.0.1:4322/`。本地默认展示安全 Mock 数据，不访问 AWS；生产环境使用 CloudFront、Cognito 和 JWT Console API。
+
 ## UI Customization
 
 React web apps in this stack share shadcn/ui primitives through `packages/ui`.
@@ -74,8 +82,11 @@ If you want to add app-specific blocks instead of shared primitives, run the sha
 ```
 github-repositories-fllow/
 ├── apps/
-│   ├── web/         # Frontend application (React + React Router)
-│   └── server/      # Backend API (Hono)
+│   ├── web/           # Frontend application
+│   ├── server/        # Backend API (Hono)
+│   ├── aiops-agent/   # AWS AI Ops orchestration, tools and Console API
+│   ├── aiops-console/ # React + TypeScript + Tailwind admin console
+│   └── aiops-mcp/     # Local stdio MCP server (no web UI)
 ├── packages/
 │   ├── ui/          # Shared shadcn/ui components and styles
 │   └── db/          # Database schema & queries
@@ -87,6 +98,8 @@ github-repositories-fllow/
 - `pnpm run build`: Build all applications
 - `pnpm run dev:web`: Start only the web application
 - `pnpm run dev:server`: Start only the server
+- `pnpm --filter aiops-console dev`: Start the local AI Ops Console preview on port 4322
+- `pnpm --filter aiops-mcp dev`: Start the stdio MCP server for an MCP Client
 - `pnpm run check-types`: Check TypeScript types across all apps
 - `pnpm run db:push`: Push schema changes to database
 - `pnpm run db:generate`: Generate database client/types

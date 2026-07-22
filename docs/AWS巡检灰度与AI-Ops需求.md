@@ -134,6 +134,14 @@ Agent 以 CloudWatch Alarm 为事故入口，通过 EventBridge 启动 Orchestra
 
 `apps/aiops-mcp` 使用 TypeScript MCP SDK 和 AWS SDK v3，通过 stdio 暴露与云端 Agent 一致的只读工具。AWS 凭据来自 SSO/Profile 临时会话，禁止保存 Access Key。写操作只创建云端审批请求，不能直接执行生产变更。
 
+### 4.6 AI Ops 管理控制台
+
+`apps/aiops-console` 是独立的 React 19 + TypeScript + Tailwind CSS 管理控制台，由 Vite 构建后部署到私有 S3，并通过 CloudFront 对外提供 HTTPS。管理员使用 Cognito OAuth2 Code + PKCE 登录，React 使用 JWT 调用受 HTTP API Authorizer 保护的 Console API Lambda。
+
+控制台提供系统健康摘要、CloudWatch 活跃告警、Synthetics Canary、DLQ 状态、CodeDeploy 记录、脱敏日志、最近 Incident 列表/详情，以及固定格式的 SNS→SQS→Consumer 安全测试事件。浏览器不持有 AWS 凭据，不接受任意 ARN、日志组或 Topic。
+
+本地开发默认进入 Mock 预览模式，不要求 Cognito，也不会访问或修改 AWS。`aiops-console` 与 `aiops-mcp` 没有运行时依赖：前者面向管理员浏览器，后者保持纯 stdio MCP Server。
+
 ## 5. 安全与合规约束
 
 - GitHub Token 保持一次性透传，永不进入 SNS、SQS、日志或事故记录。
@@ -153,9 +161,10 @@ Agent 以 CloudWatch Alarm 为事故入口，通过 EventBridge 启动 Orchestra
 - `infra/messaging.yaml`：SNS、SQS、DLQ、Consumer。
 - `infra/observability.yaml`：Synthetics、S3、Alarm、Dashboard、告警 Topic。
 - `infra/aiops.yaml`：Bedrock Agent、Action Lambda、Orchestrator、Incident 表和 EventBridge。
+- `infra/aiops-console.yaml`：React 静态托管、Cognito、JWT HTTP API 和 Console API Lambda。
 - `infra/github-oidc.yaml`：扩展部署权限和各类执行角色权限边界。
 
-部署顺序：bootstrap → 主栈 → ECS → messaging → observability → aiops。删除顺序反向执行，避免跨栈引用阻塞。
+部署顺序：bootstrap → 主栈 → ECS → messaging → observability → aiops → aiops-console。删除顺序反向执行，避免跨栈引用阻塞。
 
 ## 7. 验收演练
 
@@ -177,4 +186,3 @@ Agent 以 CloudWatch Alarm 为事故入口，通过 EventBridge 启动 Orchestra
 | 11 | api-canary-release | Lambda Alias、CodeDeploy、Hook、自动回滚 | 4、9 |
 | 12 | aiops-agent | Bedrock Agent、事故编排、审批恢复 | 9、10、11 |
 | 13 | local-aiops-mcp | 本地 MCP Server | 12（复用工具契约，选做） |
-

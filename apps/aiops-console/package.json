@@ -1,0 +1,26 @@
+{
+  "name": "aiops-console",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 4322",
+    "build": "tsc --noEmit && vite build",
+    "check-types": "tsc --noEmit",
+    "preview": "vite preview --host 127.0.0.1 --port 4322"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "catalog:",
+    "react-dom": "catalog:"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.18",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@vitejs/plugin-react": "^4.3.4",
+    "tailwindcss": "^4.1.18",
+    "typescript": "catalog:",
+    "vite": "^6.0.7"
+  }
+}

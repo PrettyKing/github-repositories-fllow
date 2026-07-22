@@ -5,11 +5,12 @@
 | 日期 | 版本 | 说明 |
 | --- | --- | --- |
 | 2026-07-21 | v1 | 初始设计 |
+| 2026-07-22 | v2 | UI 独立为 React/Tailwind Console，部署到 CloudFront + Cognito |
 
 ## 项目架构
 
-- 涉及文件: `infra/aiops.yaml`、`apps/aiops-agent/*`、`apps/server/src/ops.ts`、`apps/web/app/ops/*`、`infra/github-oidc.yaml`。
-- 数据流: Alarm → EventBridge → Orchestrator → Bedrock Agent → Action Lambda → Incident DynamoDB → SNS/UI。
+- 涉及文件: `infra/aiops.yaml`、`infra/aiops-console.yaml`、`apps/aiops-agent/*`、`apps/aiops-console/*`、`infra/github-oidc.yaml`。
+- 数据流: Alarm → EventBridge → Orchestrator → Bedrock Agent → Action Lambda → Incident DynamoDB → Console API → React Console。
 
 ## 功能模块设计
 
@@ -40,11 +41,13 @@ Action Group Lambda 采用函数定义，首版工具：
 
 执行前再次校验 Incident 状态、动作类型、目标 allowlist、有效期和幂等键。高风险动作不允许由 Agent Action Lambda 直接执行。
 
-### 模块 4: API/UI 与 Agent 自监控（F-006 / F-007）
+### 模块 4: Console API/UI 与 Agent 自监控（F-006 / F-007）
 
-Hono 新增 `/api/ops/incidents`、`/api/ops/incidents/:id`、`/api/ops/chat`、`/api/ops/actions/:id/approve|reject`，继续受现有 Basic Auth。数据读写通过独立 Ops Lambda/API 或 AWS SDK 完成，不让 Hono Lambda 获得广泛运维权限。
+`apps/aiops-console` 使用 React 19、TypeScript、Vite 和 Tailwind CSS v4。生产静态资源位于私有 S3，通过 CloudFront Origin Access Control 访问；管理员使用 Cognito Hosted UI 的 OAuth2 Code + PKCE 登录。HTTP API JWT Authorizer 校验 Cognito ID Token 后，才允许访问独立 Console API Lambda。
 
-前端 `/ops` 展示健康摘要、Incident 时间线、证据、建议动作和审批按钮。Agent 自身指标包含调用次数、失败、耗时、Token、工具错误和动作执行结果。
+Console API 提供 `/overview`、`/logs`、`/incidents/:id` 和 `/queue-tests`。它只具备环境 allowlist 内的 CloudWatch、Synthetics、SQS、CodeDeploy、DynamoDB 只读权限，以及向指定测试 SNS Topic 发布固定安全事件的权限。浏览器不持有 AWS 凭据，也不复用业务 Hono Lambda 的 Basic Auth。
+
+本地 `demoMode` 由静态 `public/config.js` 开启，直接渲染 Mock 数据并短路所有远程 API；生产流水线根据 CloudFormation 输出生成 `dist/config.js` 并强制 `demoMode=false`。Agent 自身指标包含调用次数、失败、耗时、Token、工具错误和动作执行结果。
 
 ## 数据模型
 
@@ -65,4 +68,7 @@ Incident 表主键 `incidentId`，索引支持按状态和创建时间查询；�
 | 写操作 | 人审 + 独立 Executor | 降低模型误判和提示注入风险 |
 | Incident 存储 | DynamoDB + TTL | 无需数据库网络连接，适合状态机条件更新 |
 | 诊断结果 | 证据/假设/未知分离 | 避免将模型推断包装成事实 |
-
+| Console 前端 | React + TypeScript + Vite + Tailwind CSS | 组件化、严格类型、独立构建部署 |
+| Console 认证 | Cognito OAuth2 Code + PKCE + HTTP API JWT | 浏览器无 AWS 凭据，与业务 Basic Auth 解耦 |
+| 本地开发 | Mock `demoMode` | 不依赖 Cognito/AWS，避免误操作真实资源 |
+| MCP 传输 | 仅 stdio，无前端/HTTP 端口 | 面向本地 Agent Client，与 Web Console 解耦 |

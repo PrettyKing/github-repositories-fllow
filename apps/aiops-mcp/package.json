@@ -8,6 +8,8 @@
   "scripts": {
     "build": "esbuild src/index.ts --bundle --packages=external --platform=node --format=esm --outfile=dist/index.js --banner:js='#!/usr/bin/env node'",
     "check-types": "tsc -b",
+    "dev": "tsx --env-file=.env src/index.ts",
+    "start": "node --env-file=.env dist/index.js",
     "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {

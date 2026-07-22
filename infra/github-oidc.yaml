@@ -179,6 +179,7 @@ Resources:
                   - elasticloadbalancing:*
                   - servicediscovery:*
                   - application-autoscaling:*
+                  - cognito-idp:*
                   # Task 3：主动巡检、异步消息、Lambda 渐进发布与 AI Ops
                   - cloudwatch:*
                   - synthetics:*
@@ -207,6 +208,10 @@ Resources:
                   - route53:GetChange
                   - route53:AssociateVPCWithHostedZone
                   - route53:DisassociateVPCFromHostedZone
+                Resource: "*"
+              - Sid: CloudFrontForAiOpsConsole
+                Effect: Allow
+                Action: cloudfront:*
                 Resource: "*"
               # S3 仅限 SAM 托管的构建产物桶
               - Sid: SamArtifactBucket

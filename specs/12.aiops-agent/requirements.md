@@ -9,6 +9,7 @@
 | 日期 | 版本 | 说明 |
 | --- | --- | --- |
 | 2026-07-21 | v1 | 初始需求 |
+| 2026-07-22 | v2 | AI Ops UI 调整为独立 React Console，使用 Cognito/JWT 认证 |
 
 ## 用户故事
 
@@ -22,7 +23,7 @@
 3. [F-003] Agent 输出结构化 Incident：证据、时间线、根因假设、置信/不确定性、影响范围和建议动作；不得把推断表述为已验证事实。
 4. [F-004] DynamoDB 持久化 Incident、工具调用摘要、审批状态和执行结果，并设置合理保留期。
 5. [F-005] 支持 `request_dlq_redrive` 和 `request_rollback`，只创建待审批动作；批准后由独立执行角色调用 allowlist API。
-6. [F-006] Hono/前端提供受 Basic Auth 保护的 Incident 列表、详情、Agent 对话和审批接口。
+6. [F-006] 独立 React Console 提供系统健康、Incident 列表/详情、脱敏日志和安全队列测试；生产环境通过 CloudFront + Cognito + HTTP API JWT Authorizer 保护。
 7. [F-007] 对 Agent 调用量、错误、延迟、Token 使用和恢复动作建立指标、告警和审计。
 
 ## 非功能需求
@@ -41,6 +42,7 @@
 - [ ] [AC-004] 未审批动作不能执行；过期、重复或越权审批被拒绝。
 - [ ] [AC-005] 批准后的 redrive/rollback 可执行并记录结果。
 - [ ] [AC-006] Agent 不可用时生产 API、队列消费和自动回滚仍正常。
+- [x] [AC-007] Console 可在本地 Mock 模式完整预览且不访问 AWS；生产构建关闭 Mock 并使用 Cognito/JWT。
 
 ## 依赖
 
@@ -52,4 +54,3 @@
 ## 开放问题
 
 - 部署前确认 `ap-northeast-1` 可用的目标 Bedrock 模型及账号模型访问；模型 ID 必须参数化，不能写死到业务代码。
-

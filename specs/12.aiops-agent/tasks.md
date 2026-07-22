@@ -5,6 +5,7 @@
 | 日期 | 版本 | 说明 |
 | --- | --- | --- |
 | 2026-07-21 | v1 | 初始任务 |
+| 2026-07-22 | v2 | 独立 React Console 实现与部署纳入 Feature 12 |
 
 ## 任务列表
 
@@ -22,8 +23,8 @@
 
 ### 功能 3: API、UI 与可观测性
 
-- [ ] T-007: 实现受 Basic Auth 保护的 Incident/Chat/Approve/Reject API（已交付更严格的 IAM/SigV4 Incident 列表、详情、Approve/Reject；Chat 与现有 Hono Basic Auth 接入待办） ~90min
-- [ ] T-008: 实现 `/ops` 页面：健康、Incident 列表/详情/时间线、Agent 对话和审批 UI ~120min
+- [x] T-007: 实现 Cognito JWT 保护的 Console API：Overview、日志、Incident 详情和安全消息链路测试 ~90min
+- [x] T-008: 实现独立 React/TypeScript/Tailwind Console，支持本地 Mock、CloudFront/S3 部署与 Cognito PKCE 登录 ~120min
 - [ ] T-009: 增加 Agent 调用、错误、延迟、Token、工具失败和动作执行指标/告警/审计（已交付 Lambda 错误告警和结构化审计；Token/自定义指标待补） ~60min
 
 ### 集成与测试

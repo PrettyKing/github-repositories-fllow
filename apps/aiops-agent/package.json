@@ -3,17 +3,18 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "esbuild src/orchestrator.ts src/actions.ts src/executor.ts src/api.ts --bundle --external:@aws-sdk/* --platform=node --format=esm --outdir=dist --out-extension:.js=.mjs",
+    "build": "esbuild src/orchestrator.ts src/actions.ts src/executor.ts src/api.ts src/console.ts --bundle --external:@aws-sdk/* --platform=node --format=esm --outdir=dist --out-extension:.js=.mjs",
     "check-types": "tsc -b",
     "test": "tsx --test test/*.test.ts"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-agent-runtime": "^3.848.0",
     "@aws-sdk/client-cloudwatch": "^3.848.0",
+    "@aws-sdk/client-cloudwatch-logs": "^3.848.0",
     "@aws-sdk/client-codedeploy": "^3.848.0",
     "@aws-sdk/client-dynamodb": "^3.848.0",
     "@aws-sdk/client-lambda": "^3.848.0",
-    "@aws-sdk/client-cloudwatch-logs": "^3.848.0",
+    "@aws-sdk/client-sns": "3.848.0",
     "@aws-sdk/client-sqs": "^3.848.0",
     "@aws-sdk/client-synthetics": "^3.848.0",
     "@aws-sdk/lib-dynamodb": "^3.848.0"
