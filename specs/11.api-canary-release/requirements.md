@@ -46,5 +46,4 @@
 
 ## 开放问题
 
-- ECS Go API 仍采用 rolling deployment；ECS 蓝绿不属于本 feature。
-
+- ECS Go API 的原生 CANARY 发布属于独立的 Feature 14；本 feature 只验收 Hono Lambda 的入口层灰度，跨服务联调见 `specs/14.ecs-go-canary-release`。

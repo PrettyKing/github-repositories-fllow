@@ -43,6 +43,10 @@ Parameters:
     Type: String
     Default: ""
     Description: Optional CloudWatch alarm name exported by the observability stack.
+  GoApiUrl:
+    Type: String
+    Default: ""
+    Description: Private Go API origin. The ECS stack exports the Canary-managed ALB URL.
 
 Globals:
   Function:
@@ -58,6 +62,7 @@ Conditions:
     - !Not [!Equals [!Ref ApiDomainName, ""]]
     - !Not [!Equals [!Ref ApiCertificateArn, ""]]
   HasSyntheticsAlarm: !Not [!Equals [!Ref SyntheticsAlarmName, ""]]
+  HasGoApiUrl: !Not [!Equals [!Ref GoApiUrl, ""]]
 
 Resources:
   # ──────────────────────────── 网络 ────────────────────────────
@@ -311,8 +316,8 @@ Resources:
           CORS_ORIGIN: !Ref CorsOrigin
           BASIC_AUTH_USER: !Ref BasicAuthUser
           BASIC_AUTH_PASSWORD: !Sub "{{resolve:secretsmanager:${AuthSecret}:SecretString:password}}"
-          # 薄代理：/api/* 转发到 Cloud Map 内网 DNS 上的 Go 服务；Lambda 不含 DATABASE_URL。
-          GO_API_URL: !Sub "http://go-api.${AWS::StackName}.internal:8080"
+          # 薄代理：/api/* 转发到 ECS Canary 管理的 Internal ALB；Lambda 不含 DATABASE_URL。
+          GO_API_URL: !If [HasGoApiUrl, !Ref GoApiUrl, !Sub "http://go-api.${AWS::StackName}.internal:8080"]
           # bio 生成：置真实 key 后（put-secret-value + 重部署）走 OpenRouter，否则回退模板。
           OPENROUTER_API_KEY: !Sub "{{resolve:secretsmanager:${OpenRouterSecret}:SecretString:apiKey}}"
           OPENROUTER_MODEL: !Ref OpenRouterModel

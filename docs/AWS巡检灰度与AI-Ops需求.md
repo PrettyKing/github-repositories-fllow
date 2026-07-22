@@ -6,7 +6,7 @@
 
 ## 1. 背景
 
-当前生产链路为：Cloudflare Pages → API Gateway → Hono Lambda 薄代理 → Cloud Map → ECS Fargate Go API → Aurora PostgreSQL。系统已具备 GitHub 账户/仓库同步、统计页面、SAM/CloudFormation 部署和 GitHub Actions OIDC，但缺少主动巡检、异步事件处理、渐进式发布和智能运维闭环。
+当前生产链路为：Cloudflare Pages → API Gateway → Hono Lambda 薄代理 → 私有 DNS → Internal ALB → ECS Fargate Go API → Aurora PostgreSQL。系统已补齐主动巡检、异步事件、Lambda/ECS 渐进发布和 AI 运维闭环。
 
 本次建设目标是把现有项目扩展为一套可演示、可告警、可回滚、可诊断的 AWS 生产运维样例，而不是分别创建互不相关的 AWS 服务 demo。
 
@@ -25,7 +25,7 @@
 
 ### 2.3 不在本期范围
 
-- ECS Go 服务蓝绿/Canary 发布；本期灰度对象仅为 API Gateway 后的 Hono Lambda。
+- Hono Lambda 使用 SAM/CodeDeploy API Canary；Go API 使用 ECS 原生 CANARY，二者分别在入口层和服务层控制灰度。
 - GitHub Token 异步入队或持久化。
 - Agent 自主删除 CloudFormation 栈、队列、数据库或修改 IAM。
 - 无人工确认的自动 DLQ 重放、生产回滚或扩缩容。
@@ -109,7 +109,20 @@ Hono Lambda 使用 `AutoPublishAlias: live` 和 SAM `DeploymentPreference`。默
 - 任一关键告警触发 CodeDeploy 自动回滚。
 - PostTraffic Hook：100% 切流后的最终验证。
 
-Synthetics 的 1 分钟频率应覆盖 10 分钟观察窗。ECS Go 服务继续使用现有 rolling deployment，后续需要时再单独设计 ECS 蓝绿发布。
+Synthetics 的 1 分钟频率应覆盖 10 分钟观察窗。ECS Go 服务使用 ECS 原生 `CANARY` 策略：Internal ALB 在两个 Target Group 之间先切 10% 流量，观察 10 分钟后切至 100%，再保留旧 Service Revision 5 分钟。ALB 5xx 或 Synthetics 告警触发 ECS 自动回滚。
+
+为避免低流量时 Synthetics 未随机命中 10% Green，ECS 另配置私有 Test Listener 与 `POST_TEST_TRAFFIC_SHIFT` Lambda Hook。Green 就绪后，Hook 确定性请求候选版本的 `/health` 和带 Basic Auth 的 `/api/stats`；两项通过才允许生产 Canary，失败或 2 分钟超时立即回滚。Test Listener 仅允许 Hook Security Group 访问，不暴露公网，也不供正常 Hono 代理使用。
+
+验收必须同时覆盖两层灰度：Hono Lambda 的 CodeDeploy 10%→100% 以及 Go ECS 的 10%→100%。ECS 发布记录需包含 Hook 成功、ALB 5xx/Synthetics Alarm 状态和最终 Service Deployment 状态。
+
+### 4.3.1 Go API ECS Canary
+
+- 生产 Lambda 通过 `go-api-alb.<stack>.internal` 访问 Internal ALB，不绕过流量权重。
+- ECS Deployment Controller 保持 `ECS`，Deployment Strategy 设置为 `CANARY`。
+- Blue/Green 两个 Target Group 由 ECS Infrastructure Role 管理。
+- Canary 比例为 10%，观察窗口 10 分钟，最终 bake time 为 5 分钟。
+- 旧的 `go-api.<stack>.internal` Cloud Map A 记录保留为部署迁移和紧急回退入口。
+- GitHub Actions 等待 ECS Service 稳定，并输出最新 Service Deployment 的状态、策略、告警和目标 Revision。
 
 ### 4.4 AWS AI Ops Agent
 

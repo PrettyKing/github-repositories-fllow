@@ -67,9 +67,20 @@ jobs:
             --output text 2>/dev/null || true)
           EXTRA_PARAMETERS=()
           if [ -n "$SYNTHETICS_ALARM" ] && [ "$SYNTHETICS_ALARM" != "None" ]; then
-            EXTRA_PARAMETERS=(--parameter-overrides "SyntheticsAlarmName=${SYNTHETICS_ALARM}")
+            EXTRA_PARAMETERS+=("SyntheticsAlarmName=${SYNTHETICS_ALARM}")
           fi
-          sam deploy --no-confirm-changeset --no-fail-on-empty-changeset "${EXTRA_PARAMETERS[@]}"
+          GO_API_URL=$(aws cloudformation describe-stacks --stack-name "$ECS_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='GoApiPrivateUrl'].OutputValue | [0]" \
+            --output text 2>/dev/null || true)
+          if [ -n "$GO_API_URL" ] && [ "$GO_API_URL" != "None" ]; then
+            EXTRA_PARAMETERS+=("GoApiUrl=${GO_API_URL}")
+          fi
+          if [ "${#EXTRA_PARAMETERS[@]}" -gt 0 ]; then
+            sam deploy --no-confirm-changeset --no-fail-on-empty-changeset \
+              --parameter-overrides "${EXTRA_PARAMETERS[@]}"
+          else
+            sam deploy --no-confirm-changeset --no-fail-on-empty-changeset
+          fi
 
       - name: Report gradual deployment result
         run: |
@@ -183,24 +194,105 @@ jobs:
           docker buildx build --platform linux/arm64 \
             -t "${REPO_URI}:${GITHUB_SHA}" --push apps/go-api
 
-      - name: Deploy ECS stack
+      - name: Prepare ECS Canary infrastructure without shifting production traffic
         run: |
+          CANARY_READY=$(aws cloudformation describe-stacks --stack-name "$ECS_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='CanaryStrategy'].OutputValue | [0]" \
+            --output text 2>/dev/null || true)
+          if [ -z "$CANARY_READY" ] || [ "$CANARY_READY" = "None" ]; then
+            CURRENT_TAG=$(aws cloudformation describe-stacks --stack-name "$ECS_STACK" \
+              --query "Stacks[0].Parameters[?ParameterKey=='ImageTag'].ParameterValue | [0]" --output text)
+            if [ -z "$CURRENT_TAG" ] || [ "$CURRENT_TAG" = "None" ] || [ "$CURRENT_TAG" = "bootstrap" ]; then
+              CURRENT_TAG="$GITHUB_SHA"
+            fi
+            aws cloudformation deploy \
+              --template-file infra/ecs-fargate.yaml \
+              --stack-name "$ECS_STACK" \
+              --capabilities CAPABILITY_NAMED_IAM \
+              --no-fail-on-empty-changeset \
+              --parameter-overrides DesiredCount=1 ImageTag="$CURRENT_TAG" \
+                MessagingStackName="$MESSAGING_STACK" EnableCanary=false
+          else
+            echo "ECS Canary infrastructure is already active"
+          fi
+          aws ecs wait services-stable \
+            --cluster github-repositories-fllow-cluster \
+            --services github-repositories-fllow-go-api
+
+  # 首次引入 ECS Canary 时，主栈部署阶段尚读不到新的 ALB 私网地址。
+  # ECS 稳定后再通过 Lambda 自己的 10% Canary 将代理切到 Internal ALB。
+  activate-go-canary-route:
+    needs: [deploy-ecs]
+    if: ${{ needs.deploy-ecs.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 11.9.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build:lambda
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/setup-sam@v2
+        with: { use-installer: true }
+      - name: Route Hono proxy through ECS Canary ALB
+        run: |
+          GO_API_URL=$(aws cloudformation describe-stacks --stack-name "$ECS_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='GoApiPrivateUrl'].OutputValue | [0]" --output text)
+          test -n "$GO_API_URL" && test "$GO_API_URL" != "None"
+          SYNTHETICS_ALARM=$(aws cloudformation describe-stacks --stack-name "$OBSERVABILITY_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='CanarySuccessAlarmName'].OutputValue | [0]" \
+            --output text 2>/dev/null || true)
+          PARAMETERS=("GoApiUrl=${GO_API_URL}")
+          if [ -n "$SYNTHETICS_ALARM" ] && [ "$SYNTHETICS_ALARM" != "None" ]; then
+            PARAMETERS+=("SyntheticsAlarmName=${SYNTHETICS_ALARM}")
+          fi
+          sam deploy --no-confirm-changeset --no-fail-on-empty-changeset \
+            --parameter-overrides "${PARAMETERS[@]}"
+
+  deploy-ecs-canary:
+    needs: [activate-go-canary-route]
+    if: ${{ needs.activate-go-canary-route.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy Go image with native ECS Canary
+        run: |
+          SYNTHETICS_ALARM=$(aws cloudformation describe-stacks --stack-name "$OBSERVABILITY_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='CanarySuccessAlarmName'].OutputValue | [0]" \
+            --output text 2>/dev/null || true)
+          PARAMETERS=(DesiredCount=1 "ImageTag=${GITHUB_SHA}" "MessagingStackName=${MESSAGING_STACK}" EnableCanary=true)
+          if [ -n "$SYNTHETICS_ALARM" ] && [ "$SYNTHETICS_ALARM" != "None" ]; then
+            PARAMETERS+=("SyntheticsAlarmName=${SYNTHETICS_ALARM}")
+          fi
           aws cloudformation deploy \
             --template-file infra/ecs-fargate.yaml \
             --stack-name "$ECS_STACK" \
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset \
-            --parameter-overrides DesiredCount=1 ImageTag="${GITHUB_SHA}" MessagingStackName="$MESSAGING_STACK"
-
-      - name: Wait for service to stabilize
-        run: |
+            --parameter-overrides "${PARAMETERS[@]}"
           aws ecs wait services-stable \
             --cluster github-repositories-fllow-cluster \
             --services github-repositories-fllow-go-api
+          DEPLOYMENT_ARN=$(aws ecs list-service-deployments \
+            --cluster github-repositories-fllow-cluster \
+            --service github-repositories-fllow-go-api --max-results 1 \
+            --query 'serviceDeployments[0].serviceDeploymentArn' --output text)
+          test -n "$DEPLOYMENT_ARN" && test "$DEPLOYMENT_ARN" != "None"
+          aws ecs describe-service-deployments --service-deployment-arns "$DEPLOYMENT_ARN" \
+            --query 'serviceDeployments[0].{status:status,reason:statusReason,strategy:deploymentConfiguration.strategy,alarms:alarms.status,target:targetServiceRevision.arn}'
 
   deploy-observability:
-    needs: [deploy, deploy-messaging, deploy-ecs]
-    if: ${{ always() && needs.deploy.result == 'success' && needs.deploy-messaging.result == 'success' && (needs.deploy-ecs.result == 'success' || needs.deploy-ecs.result == 'skipped') }}
+    needs: [deploy, deploy-messaging, deploy-ecs, deploy-ecs-canary]
+    if: ${{ always() && needs.deploy.result == 'success' && needs.deploy-messaging.result == 'success' && ((needs.deploy-ecs.result == 'skipped' && needs.deploy-ecs-canary.result == 'skipped') || needs.deploy-ecs-canary.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

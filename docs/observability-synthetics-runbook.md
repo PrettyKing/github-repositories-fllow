@@ -1,5 +1,7 @@
 # CloudWatch Synthetics 巡检部署与演练
 
+> Synthetics 是生产入口的外部主动巡检，不保证每次命中 10% Green。Go ECS 发布前的候选版本验证由 `infra/ecs-fargate.yaml` 中 `POST_TEST_TRAFFIC_SHIFT` Lambda Hook 完成：它通过私有 ALB `:8081` Test Listener 确定性检查 Green 的 `/health` 与 `/api/stats`。两类检查必须同时保留。
+
 本文对应 `specs/9.observability-synthetics`，用于部署和验收公网 outside-in API 巡检。
 
 ## 前置条件
@@ -76,4 +78,3 @@ aws cloudformation deploy \
 | Dashboard | Canary、API、Lambda、ECS、SQS 指标可见 | 待填写 |
 
 > `ArtifactBucket` 使用 `Retain`，删除观测栈不会删除巡检证据。确认不再需要后，应由管理员按数据保留策略清空并删除 Bucket。
-

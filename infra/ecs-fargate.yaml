@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Task 2: Go API on ECS Fargate behind an ALB, with the Hono Lambda linked as a
-  second ALB target group and internal service discovery via AWS Cloud Map.
+  Go API on ECS Fargate with native 10 percent canary deployments, an internal
+  ALB, two target groups, alarm rollback and stable private DNS.
   This stack imports the VPC/subnets/DB from the main stack (template.yaml) and
   does not recreate any network or database resource.
 
@@ -26,10 +26,21 @@ Parameters:
     Type: String
     Default: ""
     Description: Messaging stack name. Empty disables domain event publishing.
+  SyntheticsAlarmName:
+    Type: String
+    Default: ""
+    Description: Optional CloudWatch Synthetics alarm included in ECS canary rollback.
+  EnableCanary:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Enable native ECS canary after the Hono proxy is routed through the ALB.
 
 Conditions:
   HasDesiredCount: !Not [!Equals [!Ref DesiredCount, 0]]
   HasMessagingStack: !Not [!Equals [!Ref MessagingStackName, ""]]
+  HasSyntheticsAlarm: !Not [!Equals [!Ref SyntheticsAlarmName, ""]]
+  IsCanaryEnabled: !Equals [!Ref EnableCanary, "true"]
 
 Resources:
   # ──────────────────────────── ECR ────────────────────────────
@@ -71,10 +82,10 @@ Resources:
       LogGroupName: !Sub "/ecs/${MainStackName}-go-api"
       RetentionInDays: 14
 
-  # ──────────────────────────── Cloud Map（服务发现）────────────────────────────
-  # 私有 DNS 命名空间：Fargate 任务自动注册 go-api.<stack>.internal（A 记录）。
-  # 同 VPC 内的 Hono Lambda 由此按内网 DNS 直连 Go 服务（无需公网/ALB 回环），
-  # 反向 Go 服务也可用它做服务间发现 —— 这就是「用 CloudMap 链接接口」的内部链路。
+  # ──────────────────────────── Cloud Map（服务发现与无中断迁移）────────────────────────────
+  # 旧的 go-api.<stack>.internal A 记录继续作为回退入口；新的
+  # go-api-alb.<stack>.internal Alias 指向 Canary Internal ALB。流水线在 ECS
+  # 稳定后才通过 Lambda 灰度把生产代理切到新地址。
   CloudMapNamespace:
     Type: AWS::ServiceDiscovery::PrivateDnsNamespace
     Properties:
@@ -96,10 +107,11 @@ Resources:
         FailureThreshold: 1
 
   # ──────────────────────────── 安全组 ────────────────────────────
-  # 内网测试 ALB 的 SG：仅放行 VPC 内 80（不对公网开放）
+  # Internal ALB 的 SG：生产 Listener 只允许 Hono Lambda；测试 Listener 只允许发布 Hook。
   AlbSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
+      # Keep the existing immutable description to avoid replacing the production SG.
       GroupDescription: Internal test ALB - allow 80 from within VPC only
       VpcId: !ImportValue
         Fn::Sub: "${MainStackName}-VpcId"
@@ -107,15 +119,37 @@ Resources:
         - IpProtocol: tcp
           FromPort: 80
           ToPort: 80
-          CidrIp: 10.0.0.0/16
+          SourceSecurityGroupId: !ImportValue
+            Fn::Sub: "${MainStackName}-LambdaSecurityGroup"
       SecurityGroupEgress:
         - IpProtocol: "-1"
           CidrIp: 0.0.0.0/0
       Tags: [{ Key: Name, Value: !Sub "${MainStackName}-alb-sg" }]
 
+  CanaryHookSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS canary validation hook with access to the private test listener
+      VpcId: !ImportValue
+        Fn::Sub: "${MainStackName}-VpcId"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub "${MainStackName}-canary-hook-sg" }]
+
+  AlbTestIngressFromCanaryHook:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AlbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8081
+      ToPort: 8081
+      SourceSecurityGroupId: !Ref CanaryHookSecurityGroup
+
   EcsSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
+      # Keep the existing immutable description; ingress remains limited to Lambda/ALB SGs.
       GroupDescription: Fargate task - allow 8080 from Lambda and test ALB
       VpcId: !ImportValue
         Fn::Sub: "${MainStackName}-VpcId"
@@ -123,7 +157,7 @@ Resources:
         - IpProtocol: "-1"
           CidrIp: 0.0.0.0/0
       Tags: [{ Key: Name, Value: !Sub "${MainStackName}-ecs-sg" }]
-  # 生产路径：Lambda 薄代理经 Cloud Map 内网 DNS 直连 Go 服务
+  # 保留旧 Cloud Map 直连入口用于部署迁移和紧急回退；仅 Lambda SG 可访问。
   EcsIngressFromLambda:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -133,7 +167,7 @@ Resources:
       ToPort: 8080
       SourceSecurityGroupId: !ImportValue
         Fn::Sub: "${MainStackName}-LambdaSecurityGroup"
-  # 测试路径：内网 ALB 直接打 Go（仅调试用）
+  # 所有生产请求由 Internal ALB 转发到当前蓝/绿目标组。
   EcsIngressFromAlb:
     Type: AWS::EC2::SecurityGroupIngress
     Properties:
@@ -154,9 +188,8 @@ Resources:
       ToPort: 5432
       SourceSecurityGroupId: !Ref EcsSecurityGroup
 
-  # ──────────────────────────── ALB（仅测试，非生产入口）────────────────────────────
-  # 生产入口是 API Gateway→Lambda→Cloud Map→Go；这个内网 ALB 只供在 VPC 内直连
-  # 调试 Go 服务（对照架构图「ALB→ECS 仅测试」）。故 Scheme=internal、放私有子网。
+  # ──────────────────────────── ALB（生产内网入口）────────────────────────────
+  # API Gateway→Lambda→Route 53 private Alias→Internal ALB→ECS。ALB 不对公网开放。
   Alb:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
@@ -170,11 +203,37 @@ Resources:
         - !ImportValue
           Fn::Sub: "${MainStackName}-PrivateSubnet2"
 
-  # Go 服务目标组（IP 目标，Fargate awsvpc）
+  GoApiAlbRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !GetAtt CloudMapNamespace.HostedZoneId
+      Name: !Sub "go-api-alb.${MainStackName}.internal"
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Alb.DNSName
+        HostedZoneId: !GetAtt Alb.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+
+  # Blue 目标组。ECS 在每次部署后会交换蓝/绿角色。
   EcsTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
       Name: !Sub "${MainStackName}-go-tg"
+      VpcId: !ImportValue
+        Fn::Sub: "${MainStackName}-VpcId"
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Matcher: { HttpCode: "200" }
+
+  EcsCanaryTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${MainStackName}-go-b"
       VpcId: !ImportValue
         Fn::Sub: "${MainStackName}-VpcId"
       TargetType: ip
@@ -193,8 +252,84 @@ Resources:
       Port: 80
       Protocol: HTTP
       DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            ContentType: application/json
+            MessageBody: '{"error":"route_not_configured"}'
+            StatusCode: "404"
+
+  ProductionListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          Values: ["/*"]
+      Actions:
         - Type: forward
           TargetGroupArn: !Ref EcsTargetGroup
+
+  TestListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 8081
+      Protocol: HTTP
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            ContentType: application/json
+            MessageBody: '{"error":"test_route_not_configured"}'
+            StatusCode: "404"
+
+  TestListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref TestListener
+      Priority: 1
+      Conditions:
+        - Field: path-pattern
+          Values: ["/*"]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref EcsTargetGroup
+
+  AlbTarget5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${MainStackName}-go-alb-target-5xx"
+      AlarmDescription: Go API targets returned server errors during ECS canary deployment
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt Alb.LoadBalancerFullName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  AlbGenerated5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${MainStackName}-go-alb-5xx"
+      AlarmDescription: Internal ALB returned server errors during ECS canary deployment
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt Alb.LoadBalancerFullName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
 
   # ──────────────────────────── IAM（挂权限边界，与主栈防提权模型一致）────────────────────────────
   ExecutionRole:
@@ -247,6 +382,137 @@ Resources:
                   Resource: !ImportValue
                     Fn::Sub: "${MessagingStackName}-TopicArn"
           - !Ref AWS::NoValue
+
+  EcsInfrastructureRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${MainStackName}-ecs-infrastructure"
+      PermissionsBoundary: !Sub "arn:aws:iam::${AWS::AccountId}:policy/${MainStackName}-ecs-boundary"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonECSInfrastructureRolePolicyForLoadBalancers
+
+  CanaryHookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${MainStackName}-go-canary-hook"
+      PermissionsBoundary: !Sub "arn:aws:iam::${AWS::AccountId}:policy/${MainStackName}-lambda-boundary"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: validate-green
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                  - ec2:AssignPrivateIpAddresses
+                  - ec2:UnassignPrivateIpAddresses
+                Resource: "*"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !ImportValue
+                  Fn::Sub: "${MainStackName}-AuthSecretArn"
+
+  EcsLifecycleHookInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${MainStackName}-ecs-hook-invoke"
+      PermissionsBoundary: !Sub "arn:aws:iam::${AWS::AccountId}:policy/${MainStackName}-lambda-boundary"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-green-validation
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt CanaryValidationFunction.Arn
+
+  CanaryValidationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${MainStackName}-go-green-validation"
+      Description: Validates the ECS green revision through the private ALB test listener
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Timeout: 20
+      MemorySize: 128
+      Role: !GetAtt CanaryHookRole.Arn
+      VpcConfig:
+        SecurityGroupIds: [!Ref CanaryHookSecurityGroup]
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "${MainStackName}-PrivateSubnet1"
+          - !ImportValue
+            Fn::Sub: "${MainStackName}-PrivateSubnet2"
+      Environment:
+        Variables:
+          TEST_HOST: !GetAtt Alb.DNSName
+          AUTH_SECRET_ARN: !ImportValue
+            Fn::Sub: "${MainStackName}-AuthSecretArn"
+          BASIC_AUTH_USER: !Ref BasicAuthUser
+      Code:
+        ZipFile: |
+          const http = require("node:http");
+          const { SecretsManagerClient, GetSecretValueCommand } = require("@aws-sdk/client-secrets-manager");
+          const secrets = new SecretsManagerClient({});
+
+          function request(path, authorization) {
+            return new Promise((resolve, reject) => {
+              const req = http.request({
+                hostname: process.env.TEST_HOST,
+                port: 8081,
+                path,
+                method: "GET",
+                headers: authorization ? { authorization } : {},
+                timeout: 5000,
+              }, (res) => {
+                res.resume();
+                res.on("end", () => resolve(res.statusCode || 0));
+              });
+              req.on("timeout", () => req.destroy(new Error(`timeout: ${path}`)));
+              req.on("error", reject);
+              req.end();
+            });
+          }
+
+          exports.handler = async (event) => {
+            try {
+              const value = await secrets.send(new GetSecretValueCommand({ SecretId: process.env.AUTH_SECRET_ARN }));
+              const password = JSON.parse(value.SecretString || "{}").password;
+              if (!password) throw new Error("Basic Auth password is unavailable");
+              const authorization = `Basic ${Buffer.from(`${process.env.BASIC_AUTH_USER}:${password}`).toString("base64")}`;
+              const health = await request("/health");
+              const stats = await request("/api/stats", authorization);
+              if (health !== 200 || stats !== 200) throw new Error(`green validation failed: health=${health}, stats=${stats}`);
+              console.log(JSON.stringify({ result: "passed", health, stats, stage: event.lifecycleStage }));
+              return { hookStatus: "SUCCEEDED" };
+            } catch (error) {
+              console.error(JSON.stringify({ result: "failed", message: error.message, stage: event.lifecycleStage }));
+              return { hookStatus: "FAILED" };
+            }
+          };
 
   # ──────────────────────────── ECS ────────────────────────────
   Cluster:
@@ -314,7 +580,7 @@ Resources:
   Service:
     Type: AWS::ECS::Service
     # 必须等监听器就绪才能把服务挂到目标组
-    DependsOn: Listener
+    DependsOn: [ProductionListenerRule, TestListenerRule]
     Properties:
       ServiceName: !Sub "${MainStackName}-go-api"
       Cluster: !Ref Cluster
@@ -322,9 +588,34 @@ Resources:
       DesiredCount: !Ref DesiredCount
       LaunchType: FARGATE
       HealthCheckGracePeriodSeconds: 30
-      DeploymentConfiguration:
-        MinimumHealthyPercent: 100
-        MaximumPercent: 200
+      DeploymentController: { Type: ECS }
+      DeploymentConfiguration: !If
+        - IsCanaryEnabled
+        - MinimumHealthyPercent: 100
+          MaximumPercent: 200
+          Strategy: CANARY
+          CanaryConfiguration:
+            CanaryPercent: 10
+            CanaryBakeTimeInMinutes: 10
+          BakeTimeInMinutes: 5
+          Alarms:
+            Enable: true
+            Rollback: true
+            AlarmNames: !If
+              - HasSyntheticsAlarm
+              - [!Ref AlbTarget5xxAlarm, !Ref AlbGenerated5xxAlarm, !Ref SyntheticsAlarmName]
+              - [!Ref AlbTarget5xxAlarm, !Ref AlbGenerated5xxAlarm]
+          LifecycleHooks:
+            - TargetType: AWS_LAMBDA
+              HookTargetArn: !GetAtt CanaryValidationFunction.Arn
+              RoleArn: !GetAtt EcsLifecycleHookInvokeRole.Arn
+              LifecycleStages: [POST_TEST_TRAFFIC_SHIFT]
+              TimeoutConfiguration:
+                TimeoutInMinutes: 2
+                Action: ROLLBACK
+        - MinimumHealthyPercent: 100
+          MaximumPercent: 200
+          Strategy: ROLLING
       NetworkConfiguration:
         AwsvpcConfiguration:
           # 私有子网 + 经主栈 NAT 出网拉 ECR 镜像与调 GitHub；不分配公网 IP
@@ -339,12 +630,19 @@ Resources:
         - TargetGroupArn: !Ref EcsTargetGroup
           ContainerName: go-api
           ContainerPort: 8080
+          AdvancedConfiguration: !If
+            - IsCanaryEnabled
+            - AlternateTargetGroupArn: !Ref EcsCanaryTargetGroup
+              ProductionListenerRule: !Ref ProductionListenerRule
+              TestListenerRule: !Ref TestListenerRule
+              RoleArn: !GetAtt EcsInfrastructureRole.Arn
+            - !Ref AWS::NoValue
       ServiceRegistries:
         - RegistryArn: !GetAtt CloudMapService.Arn
 
 Outputs:
-  AlbTestUrl:
-    Description: 内网测试 ALB（仅 VPC 内直连 Go 调试；生产入口是 API Gateway→Lambda→Cloud Map→Go）
+  AlbUrl:
+    Description: Internal production ALB used by the Hono Lambda through private DNS
     Value: !Sub "http://${Alb.DNSName}"
   EcrRepositoryUri:
     Description: 推镜像的目标（docker push <此值>:<tag>）
@@ -354,7 +652,17 @@ Outputs:
   ServiceName:
     Value: !Sub "${MainStackName}-go-api"
   CloudMapServiceDns:
-    Description: Go 服务的内网发现名（Hono Lambda 可直连）
+    Description: Legacy direct service-discovery name retained for rollback
     Value: !Sub "go-api.${MainStackName}.internal"
+  GoApiPrivateUrl:
+    Description: Stable private production URL routed through ECS native Canary
+    Value: !Sub "http://go-api-alb.${MainStackName}.internal"
+  CanaryStrategy:
+    Condition: IsCanaryEnabled
+    Value: "10 percent for 10 minutes, then 100 percent; 5 minute final bake"
+  CanaryTestUrl:
+    Condition: IsCanaryEnabled
+    Description: Private Green-only validation endpoint, reachable only by the lifecycle hook
+    Value: !Sub "http://${Alb.DNSName}:8081"
   DesiredCountEcho:
     Value: !If [HasDesiredCount, "running", "scaled-to-zero"]

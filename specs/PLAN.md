@@ -53,7 +53,7 @@
 - 例：`2.T-001` = 序号 2 这个 feature 的 T-001；`3.F-005` = 序号 3 的 F-005。
 - **跨 feature 依赖**写全限定 ID，如 `2.T-004 依赖 1.T-003`。
 
-## 第三次 PRD（2026-07-21）切分为 5 个 feature
+## 第三次 PRD（2026-07-21）及 Go Canary 增强
 
 > 来源需求：`docs/AWS巡检灰度与AI-Ops需求.md`。在当前 Cloudflare Pages → API Gateway → Lambda 薄代理 → ECS Go → Aurora 架构上，补齐主动巡检、事件驱动、灰度发布和 AI 运维闭环。
 
@@ -64,6 +64,7 @@
 | 11 | api-canary-release | Lambda Alias + CodeDeploy 10% 灰度、Hook、自动回滚 | 3,4,9 | 🟡 实现完成，待 AWS 演练 |
 | 12 | aiops-agent | Bedrock Agent、Incident、人审恢复、独立 React Console | 4,9,10,11 | 🟡 Agent/Console 完成，待模型接入与云端演练 |
 | 13 | local-aiops-mcp | 本地 MCP Server 调用受限 AWS 运维工具 | 12 | 🟡 实现完成，待真实 Client 验收 |
+| 14 | ecs-go-canary-release | ECS 原生 Canary、双 Target Group、Internal ALB、告警回滚 | 9,11 | 🟡 实现完成，待 bootstrap 与 AWS 演练 |
 
 **推荐执行顺序**：9 → 10 → 11 → 12 → 13。9 与 10 的应用开发可并行，但两者都必须先完成 `infra/github-oidc.yaml` 的 bootstrap 权限扩展；11 依赖 9 的告警，12 依赖 9~11 的可观测证据与恢复动作。
 
@@ -72,7 +73,7 @@
 - Synthetics 每分钟执行 `/health` 浅层检查与 `/api/stats` 深层检查，后者从 Secrets Manager 取 Basic Auth。
 - GitHub Token 不入队；Go 只在数据库同步成功后发布无敏感字段的 `GitHubUserSynced` 事件。
 - 首版消息一致性采用提交后尽力发布并对失败告警；严格不丢事件的 transactional outbox 作为后续增强。
-- API 灰度仅覆盖 Hono Lambda，策略为 `Canary10Percent10Minutes`；ECS 蓝绿发布不在本期。
+- Hono Lambda 使用 `Canary10Percent10Minutes`；Go API 使用 ECS 原生 `CANARY`，先切 10% 并观察 10 分钟，通过后切至 100%。
 - AWS AI Ops 采用 Bedrock Agent + Lambda Action Group；默认只读，redrive/rollback 必须人工审批并由独立角色执行。
 - 本地 MCP 为选做，使用 stdio + AWS SSO/Profile，写工具只创建云端审批申请。
 - AI Ops Console 为独立 React + Tailwind 应用，生产前端使用 Cloudflare Pages，认证/API 使用 AWS Cognito/JWT；本地 Mock 模式不访问 AWS。它不属于 MCP，MCP 不提供 Web 页面或 HTTP 端口。

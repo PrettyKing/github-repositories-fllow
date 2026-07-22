@@ -43,7 +43,8 @@
 
 ### 数据流倒置 + Next.js + OpenRouter（对齐架构图）
 
-16. **职责倒置：Lambda 薄代理、Go 唯一连库** —— 为贴合架构图，把 Hono Lambda 改成只做「Basic Auth 校验 + 转发 + OpenRouter」，DATABASE_URL 从 Lambda 移除、安全组删掉 Lambda→RDS 入站（网络层坐实「Lambda 不连库」）。Lambda 经 `GO_API_URL`(Cloud Map 内网 DNS `go-api.<stack>.internal:8080`) 转发；建表由 Go 冷启动 `ensureSchema` 负责。ALB 从生产入口降级为 `Scheme:internal` 的仅测试资源。
+16. **职责倒置：Lambda 薄代理、Go 唯一连库** —— 为贴合架构图，把 Hono Lambda 改成只做「Basic Auth 校验 + 转发 + OpenRouter」，DATABASE_URL 从 Lambda 移除、安全组删掉 Lambda→RDS 入站（网络层坐实「Lambda 不连库」）。当时 Lambda 经 `GO_API_URL`(Cloud Map 内网 DNS `go-api.<stack>.internal:8080`) 转发；建表由 Go 冷启动 `ensureSchema` 负责。Feature 14 为实现真实 ECS Canary，已把生产入口升级为私有 DNS → Internal ALB，旧 Cloud Map 地址仅保留作迁移/回退。
+17. **容器灰度入口必须位于真实流量路径** —— 仅给一个“测试 ALB”配置双目标组不会形成生产 Canary，因为 Lambda 若继续通过 Cloud Map 直连任务，就会绕过 ALB 权重。正确迁移顺序是：先创建双目标组和私有 ALB DNS，保持旧任务不变；再用 Lambda Canary 把代理切到 ALB；最后启用 ECS 原生 `CANARY` 发布新镜像。
 17. **Lambda 代理实现** —— `app.all("/api/*")` 用 `fetch` 转发；请求体用 `await c.req.arrayBuffer()` 缓冲再发（跨 API Gateway/ALB 适配器比透传 `ReadableStream`+`duplex:"half"` 稳，反正体积都小）；透传 `Authorization` 头让 Go 二次校验，去掉 `host`/`content-length` 头。
 18. **OpenRouter 带模板兜底** —— `generateBio` 无 `OPENROUTER_API_KEY`（或非 2xx/异常）时回退到原模板串；SAM 里 secret 占位 `{"apiKey":""}`，`emptyStringAsUndefined` 让空串视为未配置，直接走模板（不发无谓请求）。填真 key 后需重部署（resolve 是部署期解析）。
 19. **Next.js 迁移三个坑** ——（a）pnpm 11.9 起 `package.json` 的 `pnpm.onlyBuiltDependencies` 不再读，构建脚本白名单要写在 `pnpm-workspace.yaml` 的 `allowBuilds:`（`sharp: true`，Next 依赖它），否则 `pnpm run` 前的 deps 检查直接失败；（b）`output:"export"` 下 tsc 对 `import "./globals.css"` 报「找不到副作用模块声明」，加一行 `declare module "*.css";`；（c）`react-router` 的 `NavLink` → `next/link` 的 `Link` + `usePathname`。共享 `packages/ui` 需在 `next.config` 里 `transpilePackages`。

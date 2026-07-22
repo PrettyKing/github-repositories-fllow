@@ -52,5 +52,4 @@ Alarm 使用能在观察窗内评估的 1 分钟周期。对低流量下错误�
 | 灰度对象 | Hono Lambda | 当前 API 入口可直接使用 SAM 原生渐进部署 |
 | 策略 | 10% / 10 分钟 | 给每分钟 Synthetics 和告警足够采样时间 |
 | 自动回滚信号 | 服务指标 + outside-in 巡检 | 同时覆盖运行时错误与端到端语义故障 |
-| ECS 灰度 | 延后 | ECS CodeDeploy 蓝绿需 ALB 双 Target Group，独立范围更安全 |
-
+| ECS Go 灰度 | 独立 Feature 14 | 由 ECS 原生 CANARY、双 Target Group、Test Listener 和生命周期 Hook 实现；本 Feature 只负责 Hono Lambda API Canary |

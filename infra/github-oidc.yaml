@@ -133,6 +133,10 @@ Resources:
               - logs:PutLogEvents
               - secretsmanager:GetSecretValue
               - sns:Publish
+              # ECS native blue/green/canary infrastructure role uses the AWS-managed
+              # load-balancer policy; the boundary must permit the same ELB operations.
+              - elasticloadbalancing:*
+              - ec2:Describe*
             Resource: "*"
 
   DeployRole:
@@ -287,6 +291,7 @@ Resources:
                     iam:PassedToService:
                       - lambda.amazonaws.com
                       - ecs-tasks.amazonaws.com
+                      - ecs.amazonaws.com
                       - synthetics.amazonaws.com
                       - codedeploy.amazonaws.com
                       - bedrock.amazonaws.com
