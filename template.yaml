@@ -417,7 +417,8 @@ Resources:
       Environment:
         Variables:
           TARGET_FUNCTION_NAME: !Ref ApiFunction
-          TARGET_FUNCTION_VERSION: !Ref ApiFunction.Version
+          # ApiFunction.Version 的 Ref 是完整版本 ARN；Invoke 的 Qualifier 只接受版本号。
+          TARGET_FUNCTION_VERSION: !Select [7, !Split [":", !Ref ApiFunction.Version]]
 
   PostTrafficHook:
     Type: AWS::Serverless::Function
