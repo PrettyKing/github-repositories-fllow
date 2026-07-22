@@ -231,6 +231,8 @@ Resources:
                   - s3:PutEncryptionConfiguration
                   - s3:GetLifecycleConfiguration
                   - s3:PutLifecycleConfiguration
+                  - s3:GetBucketVersioning
+                  - s3:PutBucketVersioning
                   - s3:GetBucketPublicAccessBlock
                   - s3:PutBucketPublicAccessBlock
                   - s3:ListBucket
