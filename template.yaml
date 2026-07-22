@@ -39,6 +39,10 @@ Parameters:
     Description: >
       Lambda 执行角色的权限边界名（由 infra/github-oidc.yaml 预先创建）。
       给 Lambda 角色挂边界后，CI 部署角色才允许创建它，且其实际权限被边界封顶。
+  SyntheticsAlarmName:
+    Type: String
+    Default: ""
+    Description: Optional CloudWatch alarm name exported by the observability stack.
 
 Globals:
   Function:
@@ -53,6 +57,7 @@ Conditions:
   HasCustomDomain: !And
     - !Not [!Equals [!Ref ApiDomainName, ""]]
     - !Not [!Equals [!Ref ApiCertificateArn, ""]]
+  HasSyntheticsAlarm: !Not [!Equals [!Ref SyntheticsAlarmName, ""]]
 
 Resources:
   # ──────────────────────────── 网络 ────────────────────────────
@@ -263,6 +268,16 @@ Resources:
       PermissionsBoundary: !Sub "arn:aws:iam::${AWS::AccountId}:policy/${LambdaBoundaryName}"
       Policies:
         - AWSLambdaVPCAccessExecutionRole
+      AutoPublishAlias: live
+      DeploymentPreference:
+        Type: Canary10Percent10Minutes
+        Alarms: !If
+          - HasSyntheticsAlarm
+          - [!Sub "${AWS::StackName}-api-alias-errors", !Sub "${AWS::StackName}-api-5xx", !Ref SyntheticsAlarmName]
+          - [!Sub "${AWS::StackName}-api-alias-errors", !Sub "${AWS::StackName}-api-5xx"]
+        Hooks:
+          PreTraffic: !Ref PreTrafficHook
+          PostTraffic: !Ref PostTrafficHook
       Environment:
         Variables:
           NODE_ENV: production
@@ -285,6 +300,100 @@ Resources:
           Properties:
             Path: /{proxy+}
             Method: ANY
+
+  ApiAliasErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-api-alias-errors"
+      AlarmDescription: API live alias returned a Lambda error during canary deployment
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiFunction
+        - Name: Resource
+          Value: !Sub "${ApiFunction}:live"
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-api-5xx"
+      AlarmDescription: HTTP API returned a server error during canary deployment
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref ServerlessHttpApi
+        - Name: Stage
+          Value: $default
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  DeploymentHookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !Sub "arn:aws:iam::${AWS::AccountId}:policy/${LambdaBoundaryName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DeploymentHookRuntime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: logs:CreateLogGroup
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-deployment-hook-*:*"
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "${ApiFunction.Arn}:*"
+              - Effect: Allow
+                Action: codedeploy:PutLifecycleEventHookExecutionStatus
+                Resource: "*"
+
+  PreTrafficHook:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-deployment-hook-pre"
+      CodeUri: apps/deployment-hooks/
+      Handler: hooks.preTraffic
+      Role: !GetAtt DeploymentHookRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TARGET_FUNCTION_NAME: !Ref ApiFunction
+          TARGET_FUNCTION_VERSION: !Ref ApiFunction.Version
+
+  PostTrafficHook:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-deployment-hook-post"
+      CodeUri: apps/deployment-hooks/
+      Handler: hooks.postTraffic
+      Role: !GetAtt DeploymentHookRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TARGET_FUNCTION_NAME: !Ref ApiFunction
+          TARGET_FUNCTION_VERSION: live
 
   # ─── API 自定义域名（可选，Cloudflare 侧再把 api.faithcal.xyz CNAME 到下方 target）───
   ApiDomain:

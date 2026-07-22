@@ -70,6 +70,43 @@ Resources:
               - ec2:DescribeSubnets
               - ec2:DescribeVpcs
               - ec2:DescribeSecurityGroups
+              # Synthetics / messaging / deployment hooks / AI Ops Lambdas share this boundary.
+              # Their inline policies remain resource-scoped; this only defines the maximum ceiling.
+              - s3:GetObject
+              - s3:PutObject
+              - s3:GetBucketLocation
+              - cloudwatch:PutMetricData
+              - cloudwatch:GetMetricData
+              - cloudwatch:GetMetricStatistics
+              - cloudwatch:DescribeAlarms
+              - cloudwatch:ListMetrics
+              - secretsmanager:GetSecretValue
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+              - sqs:StartMessageMoveTask
+              - sqs:ListMessageMoveTasks
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              - logs:StartQuery
+              - logs:GetQueryResults
+              - logs:FilterLogEvents
+              - synthetics:GetCanary
+              - synthetics:GetCanaryRuns
+              - lambda:InvokeFunction
+              - codedeploy:GetDeployment
+              - codedeploy:GetDeploymentGroup
+              - codedeploy:ListDeployments
+              - codedeploy:StopDeployment
+              - codedeploy:PutLifecycleEventHookExecutionStatus
+              - bedrock:InvokeAgent
+              - bedrock:InvokeModel
+              - events:PutEvents
+              - sns:Publish
             Resource: "*"
 
   # ECS 任务执行/任务角色的权限边界（Task 2 的 ecs-fargate.yaml 按名引用）。
@@ -92,6 +129,7 @@ Resources:
               - logs:CreateLogStream
               - logs:PutLogEvents
               - secretsmanager:GetSecretValue
+              - sns:Publish
             Resource: "*"
 
   DeployRole:
@@ -138,6 +176,16 @@ Resources:
                   - elasticloadbalancing:*
                   - servicediscovery:*
                   - application-autoscaling:*
+                  # Task 3：主动巡检、异步消息、Lambda 渐进发布与 AI Ops
+                  - cloudwatch:*
+                  - synthetics:*
+                  - sns:*
+                  - sqs:*
+                  - dynamodb:*
+                  - events:*
+                  - codedeploy:*
+                  - bedrock:*
+                  - aiops:*
                 Resource: "*"
                 Condition:
                   StringEquals:
@@ -164,6 +212,31 @@ Resources:
                 Resource:
                   - "arn:aws:s3:::aws-sam-cli-managed-*"
                   - "arn:aws:s3:::aws-sam-cli-managed-*/*"
+              # Synthetics 运行产物桶由观测栈管理，名称强制使用主栈前缀。
+              - Sid: ProjectArtifactBuckets
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:GetBucketLocation
+                  - s3:GetBucketPolicy
+                  - s3:PutBucketPolicy
+                  - s3:DeleteBucketPolicy
+                  - s3:GetBucketTagging
+                  - s3:PutBucketTagging
+                  - s3:GetEncryptionConfiguration
+                  - s3:PutEncryptionConfiguration
+                  - s3:GetLifecycleConfiguration
+                  - s3:PutLifecycleConfiguration
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub "arn:aws:s3:::${DeployStackName}-*"
+                  - !Sub "arn:aws:s3:::${DeployStackName}-*/*"
               # 创建/改写角色：强制必须挂上面的权限边界，且限本栈前缀。
               # 这样即使注入 admin 内联策略，实际权限也被边界压住，无法提权。
               - Sid: CreateOrModifyBoundedRoles
@@ -208,6 +281,10 @@ Resources:
                     iam:PassedToService:
                       - lambda.amazonaws.com
                       - ecs-tasks.amazonaws.com
+                      - synthetics.amazonaws.com
+                      - codedeploy.amazonaws.com
+                      - bedrock.amazonaws.com
+                      - events.amazonaws.com
               # RDS 等服务首次使用需要的服务关联角色
               - Sid: ServiceLinkedRoles
                 Effect: Allow

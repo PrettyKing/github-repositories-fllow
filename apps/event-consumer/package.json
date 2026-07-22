@@ -1,0 +1,20 @@
+{
+  "name": "event-consumer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsdown",
+    "check-types": "tsc -b",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-cloudwatch": "^3.917.0",
+    "@aws-sdk/client-dynamodb": "^3.917.0"
+  },
+  "devDependencies": {
+    "@github-repositories-fllow/config": "workspace:*",
+    "@types/aws-lambda": "^8.10.152",
+    "tsdown": "^0.21.9",
+    "typescript": "catalog:"
+  }
+}

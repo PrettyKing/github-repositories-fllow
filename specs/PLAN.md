@@ -52,3 +52,26 @@
 - 功能需求 / 任务 / 验收标准 ID **在单个 feature 内编号**，跨 feature 用 `{序号}.` 前缀区分。
 - 例：`2.T-001` = 序号 2 这个 feature 的 T-001；`3.F-005` = 序号 3 的 F-005。
 - **跨 feature 依赖**写全限定 ID，如 `2.T-004 依赖 1.T-003`。
+
+## 第三次 PRD（2026-07-21）切分为 5 个 feature
+
+> 来源需求：`docs/AWS巡检灰度与AI-Ops需求.md`。在当前 Cloudflare Pages → API Gateway → Lambda 薄代理 → ECS Go → Aurora 架构上，补齐主动巡检、事件驱动、灰度发布和 AI 运维闭环。
+
+| 序号 | feature | 说明 | 依赖 | 状态 |
+| --- | --- | --- | --- | --- |
+| 9 | observability-synthetics | Synthetics 深浅巡检、CloudWatch Alarm/Dashboard、SNS 通知 | 3,4、当前 ECS 架构 | 🟡 实现完成，待 AWS 演练 |
+| 10 | event-driven-sns-sqs | GitHub 同步领域事件、SNS/SQS、Consumer、DLQ/redrive | 4,6,7；可复用 9 的通知 | 🟡 实现完成，待 AWS 演练 |
+| 11 | api-canary-release | Lambda Alias + CodeDeploy 10% 灰度、Hook、自动回滚 | 3,4,9 | 🟡 实现完成，待 AWS 演练 |
+| 12 | aiops-agent | Bedrock Agent、告警诊断、Incident、人审恢复 | 4,9,10,11 | 🟡 后端核心完成，UI/云端验收待办 |
+| 13 | local-aiops-mcp | 本地 MCP Server 调用受限 AWS 运维工具 | 12 | 🟡 实现完成，待真实 Client 验收 |
+
+**推荐执行顺序**：9 → 10 → 11 → 12 → 13。9 与 10 的应用开发可并行，但两者都必须先完成 `infra/github-oidc.yaml` 的 bootstrap 权限扩展；11 依赖 9 的告警，12 依赖 9~11 的可观测证据与恢复动作。
+
+### 本次采用的默认决策
+
+- Synthetics 每分钟执行 `/health` 浅层检查与 `/api/stats` 深层检查，后者从 Secrets Manager 取 Basic Auth。
+- GitHub Token 不入队；Go 只在数据库同步成功后发布无敏感字段的 `GitHubUserSynced` 事件。
+- 首版消息一致性采用提交后尽力发布并对失败告警；严格不丢事件的 transactional outbox 作为后续增强。
+- API 灰度仅覆盖 Hono Lambda，策略为 `Canary10Percent10Minutes`；ECS 蓝绿发布不在本期。
+- AWS AI Ops 采用 Bedrock Agent + Lambda Action Group；默认只读，redrive/rollback 必须人工审批并由独立角色执行。
+- 本地 MCP 为选做，使用 stdio + AWS SSO/Profile，写工具只创建云端审批申请。

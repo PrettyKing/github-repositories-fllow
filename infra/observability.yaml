@@ -1,0 +1,341 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudWatch Synthetics outside-in checks, alarms, dashboard and notifications.
+
+Parameters:
+  MainStackName:
+    Type: String
+    Default: github-repositories-fllow
+    Description: Main stack whose API and Secret exports are monitored.
+  EnvironmentName:
+    Type: String
+    Default: production
+    AllowedPattern: "^[a-zA-Z0-9-]+$"
+  CanaryName:
+    Type: String
+    Default: prod-api-journey
+    AllowedPattern: "^[0-9A-Za-z_-]{1,21}$"
+    Description: Globally unique Canary name (CloudWatch limit is 21 characters).
+  CanaryCodeS3Bucket:
+    Type: String
+    Description: S3 bucket containing the packaged Canary source zip.
+  CanaryCodeS3Key:
+    Type: String
+    Description: S3 key containing the packaged Canary source zip.
+  CanaryCodeS3Version:
+    Type: String
+    Default: ""
+    Description: Optional immutable S3 object version for the Canary source zip.
+  CanaryRuntimeVersion:
+    Type: String
+    Default: syn-nodejs-puppeteer-11.0
+    Description: CloudWatch Synthetics runtime version validated for the packaged script.
+  CanaryEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Set false to retain the Canary while pausing its recurring schedule.
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional email endpoint; the recipient must confirm the SNS subscription.
+  ArtifactRetentionDays:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    MaxValue: 365
+  DeepCheckTimeoutMs:
+    Type: Number
+    Default: 3000
+    MinValue: 500
+    MaxValue: 25000
+  ApiGatewayStage:
+    Type: String
+    Default: "$default"
+  CanaryRoleBoundaryName:
+    Type: String
+    Default: github-repositories-fllow-lambda-boundary
+    Description: Shared runtime permissions boundary created by the bootstrap stack.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+  HasCodeVersion: !Not [!Equals [!Ref CanaryCodeS3Version, ""]]
+  IsCanaryEnabled: !Equals [!Ref CanaryEnabled, "true"]
+
+Resources:
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-canary-artifacts
+            Status: Enabled
+            ExpirationInDays: !Ref ArtifactRetentionDays
+            NoncurrentVersionExpiration: { NoncurrentDays: 1 }
+      VersioningConfiguration: { Status: Enabled }
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Component, Value: synthetics }
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub "${ArtifactBucket.Arn}/*"
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  OpsAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Component, Value: observability }
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref OpsAlertTopic
+
+  CanaryExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${MainStackName}-${EnvironmentName}-synthetics"
+      PermissionsBoundary: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${CanaryRoleBoundaryName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: synthetics-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteArtifacts
+                Effect: Allow
+                Action: [s3:PutObject, s3:GetBucketLocation]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/canary/*"
+              - Sid: ReadOneAuthSecret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !ImportValue
+                  Fn::Sub: "${MainStackName}-AuthSecretArn"
+              - Sid: PublishSyntheticsMetrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: { "cloudwatch:namespace": CloudWatchSynthetics }
+              - Sid: WriteCanaryLogs
+                Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/cwsyn-*"
+
+  ApiJourneyCanary:
+    Type: AWS::Synthetics::Canary
+    Properties:
+      Name: !Ref CanaryName
+      ArtifactS3Location: !Sub "s3://${ArtifactBucket}/canary/"
+      Code:
+        Handler: api-journey.handler
+        S3Bucket: !Ref CanaryCodeS3Bucket
+        S3Key: !Ref CanaryCodeS3Key
+        S3ObjectVersion: !If [HasCodeVersion, !Ref CanaryCodeS3Version, !Ref "AWS::NoValue"]
+      ExecutionRoleArn: !GetAtt CanaryExecutionRole.Arn
+      RuntimeVersion: !Ref CanaryRuntimeVersion
+      Schedule:
+        Expression: rate(1 minute)
+        DurationInSeconds: "0"
+      RunConfig:
+        ActiveTracing: false
+        EnvironmentVariables:
+          API_URL: !Sub
+            - "https://${Endpoint}"
+            - Endpoint: !ImportValue
+                Fn::Sub: "${MainStackName}-ApiEndpoint"
+          AUTH_SECRET_ARN: !ImportValue
+            Fn::Sub: "${MainStackName}-AuthSecretArn"
+          DEEP_CHECK_TIMEOUT_MS: !Ref DeepCheckTimeoutMs
+        TimeoutInSeconds: 30
+      StartCanaryAfterCreation: !If [IsCanaryEnabled, true, false]
+      SuccessRetentionPeriod: 7
+      FailureRetentionPeriod: 30
+      Tags:
+        - { Key: Environment, Value: !Ref EnvironmentName }
+        - { Key: Component, Value: synthetics }
+
+  CanarySuccessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: API journey failed for two consecutive one-minute periods.
+      Namespace: CloudWatchSynthetics
+      MetricName: SuccessPercent
+      Dimensions: [{ Name: CanaryName, Value: !Ref ApiJourneyCanary }]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 100
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref OpsAlertTopic]
+      OKActions: [!Ref OpsAlertTopic]
+
+  CanaryDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: API journey duration exceeded the initial latency budget.
+      Namespace: CloudWatchSynthetics
+      MetricName: Duration
+      Dimensions: [{ Name: CanaryName, Value: !Ref ApiJourneyCanary }]
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref DeepCheckTimeoutMs
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertTopic]
+      OKActions: [!Ref OpsAlertTopic]
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: HTTP API returned server errors.
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Select
+            - 0
+            - !Split
+              - "."
+              - !ImportValue
+                Fn::Sub: "${MainStackName}-ApiEndpoint"
+        - { Name: Stage, Value: !Ref ApiGatewayStage }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertTopic]
+      OKActions: [!Ref OpsAlertTopic]
+
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Hono proxy Lambda returned invocation errors.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Select
+            - 6
+            - !Split
+              - ":"
+              - !ImportValue
+                Fn::Sub: "${MainStackName}-ApiFunctionArn"
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertTopic]
+      OKActions: [!Ref OpsAlertTopic]
+
+  LambdaThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Hono proxy Lambda was throttled.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Select
+            - 6
+            - !Split
+              - ":"
+              - !ImportValue
+                Fn::Sub: "${MainStackName}-ApiFunctionArn"
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsAlertTopic]
+      OKActions: [!Ref OpsAlertTopic]
+
+  OperationsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${MainStackName}-${EnvironmentName}-operations"
+      DashboardBody: !Sub
+        - |
+          {
+            "widgets": [
+              {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Canary success and duration","view":"timeSeries","metrics":[["CloudWatchSynthetics","SuccessPercent","CanaryName","${CanaryName}",{"stat":"Average","period":60}],[".","Duration",".",".",{"stat":"Average","period":60,"yAxis":"right"}]]}},
+              {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"API Gateway 5xx","view":"timeSeries","metrics":[["AWS/ApiGateway","5xx","ApiId","${ApiId}","Stage","${ApiStage}",{"stat":"Sum","period":60}]]}},
+              {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"Lambda errors and throttles","view":"timeSeries","metrics":[["AWS/Lambda","Errors","FunctionName","${FunctionName}",{"stat":"Sum","period":60}],[".","Throttles",".",".",{"stat":"Sum","period":60}]]}},
+              {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"region":"${AWS::Region}","title":"ECS service","view":"timeSeries","metrics":[["AWS/ECS","CPUUtilization","ClusterName","${EcsCluster}","ServiceName","${EcsService}",{"stat":"Average","period":60}],[".","MemoryUtilization",".",".",".",".",{"stat":"Average","period":60}]]}},
+              {"type":"metric","x":0,"y":12,"width":24,"height":6,"properties":{"region":"${AWS::Region}","title":"SQS reserved metrics (Feature 10)","view":"timeSeries","metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${MainStackName}-events",{"stat":"Maximum","period":60}],[".","ApproximateNumberOfMessagesVisible",".","${MainStackName}-events-dlq",{"stat":"Maximum","period":60}]]}}
+            ]
+          }
+        - CanaryName: !Ref ApiJourneyCanary
+          ApiId: !Select
+            - 0
+            - !Split
+              - "."
+              - !ImportValue
+                Fn::Sub: "${MainStackName}-ApiEndpoint"
+          ApiStage: !Ref ApiGatewayStage
+          FunctionName: !Select
+            - 6
+            - !Split
+              - ":"
+              - !ImportValue
+                Fn::Sub: "${MainStackName}-ApiFunctionArn"
+          EcsCluster: !Sub "${MainStackName}-cluster"
+          EcsService: !Sub "${MainStackName}-go-api"
+
+Outputs:
+  CanaryName:
+    Value: !Ref ApiJourneyCanary
+  CanarySuccessAlarmName:
+    Value: !Ref CanarySuccessAlarm
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+  OpsAlertTopicArn:
+    Value: !Ref OpsAlertTopic
+    Export: { Name: !Sub "${AWS::StackName}-OpsAlertTopicArn" }
+  DashboardName:
+    Value: !Ref OperationsDashboard

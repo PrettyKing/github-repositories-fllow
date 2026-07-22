@@ -22,9 +22,14 @@ Parameters:
     Type: String
     Default: admin
     Description: 与主栈一致的 Basic Auth 用户名（密码从主栈 AuthSecret 注入）。
+  MessagingStackName:
+    Type: String
+    Default: ""
+    Description: Messaging stack name. Empty disables domain event publishing.
 
 Conditions:
   HasDesiredCount: !Not [!Equals [!Ref DesiredCount, 0]]
+  HasMessagingStack: !Not [!Equals [!Ref MessagingStackName, ""]]
 
 Resources:
   # ──────────────────────────── ECR ────────────────────────────
@@ -230,6 +235,18 @@ Resources:
           - Effect: Allow
             Principal: { Service: ecs-tasks.amazonaws.com }
             Action: sts:AssumeRole
+      Policies:
+        - !If
+          - HasMessagingStack
+          - PolicyName: publish-github-events
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: sns:Publish
+                  Resource: !ImportValue
+                    Fn::Sub: "${MessagingStackName}-TopicArn"
+          - !Ref AWS::NoValue
 
   # ──────────────────────────── ECS ────────────────────────────
   Cluster:
@@ -262,6 +279,12 @@ Resources:
               Value: "8080"
             - Name: BASIC_AUTH_USER
               Value: !Ref BasicAuthUser
+            - !If
+              - HasMessagingStack
+              - Name: GITHUB_EVENTS_TOPIC_ARN
+                Value: !ImportValue
+                  Fn::Sub: "${MessagingStackName}-TopicArn"
+              - !Ref AWS::NoValue
             # DATABASE_URL 含密码：与主栈 Lambda 同法，用 resolve 在部署期组装内网连接串
             - Name: DATABASE_URL
               Value: !Sub

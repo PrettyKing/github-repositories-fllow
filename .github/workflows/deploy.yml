@@ -4,6 +4,12 @@ on:
   push:
     branches: [main, master]
   workflow_dispatch:
+    inputs:
+      deploy_aiops:
+        description: Deploy the Bedrock AI Ops stack after model access is confirmed
+        required: false
+        type: boolean
+        default: false
 
 # OIDC 假设角色需要的权限
 permissions:
@@ -14,6 +20,9 @@ env:
   AWS_REGION: ap-northeast-1
   ECS_STACK: github-repositories-fllow-ecs
   ECR_REPO: github-repositories-fllow-go-api
+  MESSAGING_STACK: github-repositories-fllow-messaging
+  OBSERVABILITY_STACK: github-repositories-fllow-observability
+  AIOPS_STACK: github-repositories-fllow-aiops
 
 jobs:
   # 主栈：Lambda 薄代理 + VPC + Aurora（前端已迁 Pages，这里只打 Lambda 产物）
@@ -52,7 +61,68 @@ jobs:
         run: sam validate --lint --region ${{ env.AWS_REGION }}
 
       - name: SAM deploy
-        run: sam deploy --no-confirm-changeset --no-fail-on-empty-changeset
+        run: |
+          SYNTHETICS_ALARM=$(aws cloudformation describe-stacks --stack-name "$OBSERVABILITY_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='CanarySuccessAlarmName'].OutputValue | [0]" \
+            --output text 2>/dev/null || true)
+          EXTRA_PARAMETERS=()
+          if [ -n "$SYNTHETICS_ALARM" ] && [ "$SYNTHETICS_ALARM" != "None" ]; then
+            EXTRA_PARAMETERS=(--parameter-overrides "SyntheticsAlarmName=${SYNTHETICS_ALARM}")
+          fi
+          sam deploy --no-confirm-changeset --no-fail-on-empty-changeset "${EXTRA_PARAMETERS[@]}"
+
+      - name: Report gradual deployment result
+        run: |
+          APP=$(aws cloudformation list-stack-resources --stack-name github-repositories-fllow \
+            --query "StackResourceSummaries[?ResourceType=='AWS::CodeDeploy::Application'].PhysicalResourceId | [0]" --output text)
+          GROUP=$(aws cloudformation list-stack-resources --stack-name github-repositories-fllow \
+            --query "StackResourceSummaries[?ResourceType=='AWS::CodeDeploy::DeploymentGroup'].PhysicalResourceId | [0]" --output text)
+          if [ "$APP" != "None" ] && [ "$GROUP" != "None" ]; then
+            DEPLOYMENT=$(aws deploy list-deployments --application-name "$APP" --deployment-group-name "$GROUP" \
+              --query 'deploymentIds[0]' --output text)
+            if [ "$DEPLOYMENT" != "None" ]; then
+              aws deploy get-deployment --deployment-id "$DEPLOYMENT" \
+                --query 'deploymentInfo.{id:deploymentId,status:status,error:errorInformation.message}'
+            fi
+          fi
+
+  # 事件栈先于 ECS 部署，使 Go Task Role/环境变量可以安全引用 Topic export。
+  deploy-messaging:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 11.9.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - name: Build event consumer
+        run: pnpm --filter event-consumer build
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/setup-sam@v2
+        with: { use-installer: true }
+      - name: Deploy messaging stack
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ALARM_TOPIC=$(aws cloudformation describe-stacks --stack-name "$OBSERVABILITY_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='OpsAlertTopicArn'].OutputValue | [0]" \
+            --output text 2>/dev/null || true)
+          EXTRA_PARAMETERS=()
+          if [ -n "$ALARM_TOPIC" ] && [ "$ALARM_TOPIC" != "None" ]; then
+            EXTRA_PARAMETERS=("AlarmTopicArn=${ALARM_TOPIC}")
+          fi
+          sam deploy --template-file infra/messaging.yaml \
+            --stack-name "$MESSAGING_STACK" --resolve-s3 \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-confirm-changeset --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              MainStackName=github-repositories-fllow \
+              PermissionsBoundaryArn="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/github-repositories-fllow-lambda-boundary" \
+              "${EXTRA_PARAMETERS[@]}"
 
   # 检测本次 push 是否改动了 Go 服务或其 IaC，只有变了才重部署 ECS（避免每次 push 都滚服务）
   changes:
@@ -67,6 +137,8 @@ jobs:
           filters: |
             go:
               - 'apps/go-api/**'
+              - 'apps/event-consumer/**'
+              - 'infra/messaging.yaml'
               - 'infra/ecs-fargate.yaml'
               - 'infra/github-oidc.yaml'
               - '.github/workflows/deploy.yml'
@@ -74,7 +146,7 @@ jobs:
   # ECS Go 栈：构建 arm64 镜像 → 推 ECR → 部署/更新服务（唯一 DB 访问方）
   # needs deploy：确保主栈（被 ECS 栈 ImportValue 依赖）先就绪，首次部署顺序正确
   deploy-ecs:
-    needs: [deploy, changes]
+    needs: [deploy, deploy-messaging, changes]
     if: ${{ needs.changes.outputs.go == 'true' }}
     runs-on: ubuntu-latest
     steps:
@@ -118,10 +190,77 @@ jobs:
             --stack-name "$ECS_STACK" \
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset \
-            --parameter-overrides DesiredCount=1 ImageTag="${GITHUB_SHA}"
+            --parameter-overrides DesiredCount=1 ImageTag="${GITHUB_SHA}" MessagingStackName="$MESSAGING_STACK"
 
       - name: Wait for service to stabilize
         run: |
           aws ecs wait services-stable \
             --cluster github-repositories-fllow-cluster \
             --services github-repositories-fllow-go-api
+
+  deploy-observability:
+    needs: [deploy, deploy-messaging, deploy-ecs]
+    if: ${{ always() && needs.deploy.result == 'success' && needs.deploy-messaging.result == 'success' && (needs.deploy-ecs.result == 'success' || needs.deploy-ecs.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Package Canary in the SAM artifact bucket
+        run: |
+          ARTIFACT_BUCKET=$(aws cloudformation describe-stacks --stack-name aws-sam-cli-managed-default \
+            --query "Stacks[0].Outputs[?OutputKey=='SourceBucket'].OutputValue | [0]" --output text)
+          test -n "$ARTIFACT_BUCKET" && test "$ARTIFACT_BUCKET" != "None"
+          WORK_DIR=$(mktemp -d)
+          mkdir -p "$WORK_DIR/nodejs/node_modules"
+          npm install --prefix "$WORK_DIR/nodejs" --omit=dev @aws-sdk/client-secrets-manager@3.848.0
+          cp synthetics/api-journey.js "$WORK_DIR/nodejs/node_modules/api-journey.js"
+          cd "$WORK_DIR"
+          zip -qr api-journey.zip nodejs
+          KEY="synthetics/api-journey-${GITHUB_SHA}.zip"
+          aws s3 cp api-journey.zip "s3://${ARTIFACT_BUCKET}/${KEY}"
+          VERSION=$(aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key "$KEY" --query VersionId --output text)
+          if [ "$VERSION" = "None" ]; then VERSION=""; fi
+          echo "bucket=$ARTIFACT_BUCKET" >> "$GITHUB_ENV"
+          echo "key=$KEY" >> "$GITHUB_ENV"
+          echo "version=$VERSION" >> "$GITHUB_ENV"
+      - name: Deploy observability stack
+        run: |
+          aws cloudformation deploy --template-file infra/observability.yaml \
+            --stack-name "$OBSERVABILITY_STACK" --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              MainStackName=github-repositories-fllow \
+              CanaryCodeS3Bucket="$bucket" CanaryCodeS3Key="$key" CanaryCodeS3Version="$version"
+
+  deploy-aiops:
+    needs: [deploy-observability]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_aiops }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with: { version: 11.9.0 }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/setup-sam@v2
+        with: { use-installer: true }
+      - name: Build and deploy AI Ops
+        run: |
+          DLQ_ARN=$(aws cloudformation describe-stacks --stack-name "$MESSAGING_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='DLQArn'].OutputValue | [0]" --output text)
+          QUEUE_ARN=$(aws cloudformation describe-stacks --stack-name "$MESSAGING_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='QueueArn'].OutputValue | [0]" --output text)
+          pnpm --filter aiops-agent build
+          sam deploy --template-file infra/aiops.yaml --stack-name "$AIOPS_STACK" \
+            --resolve-s3 --capabilities CAPABILITY_NAMED_IAM \
+            --no-confirm-changeset --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              AllowedDlqArns="$DLQ_ARN" AllowedSourceQueueArns="$QUEUE_ARN"

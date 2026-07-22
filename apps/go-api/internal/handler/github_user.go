@@ -1,11 +1,17 @@
 package handler
 
 import (
+	"context"
+	"crypto/rand"
 	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/PrettyKing/github-repositories-fllow/apps/go-api/internal/events"
 	"github.com/PrettyKing/github-repositories-fllow/apps/go-api/internal/github"
 	"github.com/PrettyKing/github-repositories-fllow/apps/go-api/internal/model"
 	"github.com/PrettyKing/github-repositories-fllow/apps/go-api/internal/repository"
@@ -14,10 +20,37 @@ import (
 type GitHubUserHandler struct {
 	repository *repository.GitHubUserRepository
 	github     *github.Client
+	publisher  events.Publisher
 }
 
-func NewGitHubUserHandler(repository *repository.GitHubUserRepository, githubClient *github.Client) *GitHubUserHandler {
-	return &GitHubUserHandler{repository: repository, github: githubClient}
+func NewGitHubUserHandler(repository *repository.GitHubUserRepository, githubClient *github.Client, publishers ...events.Publisher) *GitHubUserHandler {
+	p := events.Publisher(events.NoopPublisher{})
+	if len(publishers) > 0 && publishers[0] != nil {
+		p = publishers[0]
+	}
+	return &GitHubUserHandler{repository: repository, github: githubClient, publisher: p}
+}
+
+func newEventID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("fallback-%d", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%x", b)
+}
+func requestCorrelationID(r *http.Request) string {
+	if v := strings.TrimSpace(r.Header.Get("X-Correlation-ID")); v != "" && len(v) <= 128 {
+		return v
+	}
+	return newEventID()
+}
+func (h *GitHubUserHandler) publishSynced(r *http.Request, user model.GitHubUser, created bool, reposCount int) {
+	e := events.GitHubUserSynced{EventVersion: "1", EventType: events.EventTypeGitHubUserSynced, EventID: newEventID(), OccurredAt: time.Now().UTC(), CorrelationID: requestCorrelationID(r), UserID: user.ID, GitHubID: user.GitHubID, Username: user.Login, ReposCount: reposCount, Created: created}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := h.publisher.Publish(ctx, e); err != nil {
+		log.Printf(`{"level":"error","event":"sns_publish_failed","eventId":%q,"correlationId":%q,"errorClass":"publish_failed","_aws":{"Timestamp":%d,"CloudWatchMetrics":[{"Namespace":"GitHubRepositoriesFollow/Messaging","Dimensions":[[]],"Metrics":[{"Name":"EventPublishFailures","Unit":"Count"}]}]},"EventPublishFailures":1}`, e.EventID, e.CorrelationID, time.Now().UnixMilli())
+	}
 }
 
 // syncResponse 与 Node 的 { ...row, created, reposCount, truncated } 保持一致：
@@ -66,6 +99,7 @@ func (h *GitHubUserHandler) Sync(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save user"})
 		return
 	}
+	h.publishSynced(r, user, created, reposCount)
 
 	status := http.StatusOK
 	if created {
@@ -192,6 +226,7 @@ func (h *GitHubUserHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to save user"})
 		return
 	}
+	h.publishSynced(r, user, created, reposCount)
 
 	writeJSON(w, http.StatusOK, syncResponse{
 		GitHubUser: user,

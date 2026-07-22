@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: GitHub sync domain events through SNS, SQS, Lambda, and a restricted DLQ.
+
+Parameters:
+  MainStackName:
+    Type: String
+    Default: github-repositories-fllow
+  AllowTestFailure:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  AlarmTopicArn:
+    Type: String
+    Default: ""
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ""
+
+Conditions:
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, ""]]
+
+Resources:
+  GitHubEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${MainStackName}-github-events"
+      KmsMasterKeyId: alias/aws/sns
+
+  GitHubEventsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${MainStackName}-github-events-dlq"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      RedriveAllowPolicy:
+        redrivePermission: byQueue
+        # Build the ARN from the deterministic queue name to avoid a CFN cycle:
+        # source queue -> DLQ (RedrivePolicy) -> source queue (allow policy).
+        sourceQueueArns:
+          - !Sub "arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${MainStackName}-github-events"
+
+  GitHubEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${MainStackName}-github-events"
+      MessageRetentionPeriod: 345600
+      VisibilityTimeout: 90
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt GitHubEventsDLQ.Arn
+        maxReceiveCount: 3
+
+  GitHubEventsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref GitHubEventsQueue]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowOnlyTopicDelivery
+            Effect: Allow
+            Principal: {Service: sns.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt GitHubEventsQueue.Arn
+            Condition:
+              ArnEquals: {aws:SourceArn: !Ref GitHubEventsTopic}
+
+  GitHubEventsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref GitHubEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt GitHubEventsQueue.Arn
+      RawMessageDelivery: true
+
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${MainStackName}-event-idempotency"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: eventId, AttributeType: S}]
+      KeySchema: [{AttributeName: eventId, KeyType: HASH}]
+      SSESpecification: {SSEEnabled: true}
+      TimeToLiveSpecification: {AttributeName: expiresAt, Enabled: true}
+
+  ConsumerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${MainStackName}-event-consumer"
+      RetentionInDays: 14
+
+  ConsumerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${MainStackName}-event-consumer"
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref AWS::NoValue]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: "sts:AssumeRole"}]
+      Policies:
+        - PolicyName: consumer-minimum
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ConsumerLogGroup.Arn}:*"
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes]
+                Resource: !GetAtt GitHubEventsQueue.Arn
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:DeleteItem]
+                Resource: !GetAtt IdempotencyTable.Arn
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition: {StringEquals: {cloudwatch:namespace: GitHubRepositoriesFollow/Messaging}}
+
+  ConsumerFunction:
+    Type: AWS::Serverless::Function
+    DependsOn: ConsumerLogGroup
+    Properties:
+      FunctionName: !Sub "${MainStackName}-event-consumer"
+      CodeUri: ../apps/event-consumer/dist/
+      Handler: handler.handler
+      Runtime: nodejs22.x
+      Architectures: [arm64]
+      Timeout: 15
+      MemorySize: 256
+      Role: !GetAtt ConsumerRole.Arn
+      Environment:
+        Variables:
+          IDEMPOTENCY_TABLE_NAME: !Ref IdempotencyTable
+          ALLOW_TEST_FAILURE: !Ref AllowTestFailure
+      Events:
+        Queue:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt GitHubEventsQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes: [ReportBatchItemFailures]
+
+  DLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${MainStackName}-github-events-dlq-not-empty"
+      AlarmDescription: GitHub events require investigation and controlled redrive.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt GitHubEventsDLQ.QueueName}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref AWS::NoValue]
+
+Outputs:
+  TopicArn:
+    Value: !Ref GitHubEventsTopic
+    Export: {Name: !Sub "${AWS::StackName}-TopicArn"}
+  QueueUrl: {Value: !Ref GitHubEventsQueue}
+  QueueArn: {Value: !GetAtt GitHubEventsQueue.Arn}
+  DLQUrl: {Value: !Ref GitHubEventsDLQ}
+  DLQArn: {Value: !GetAtt GitHubEventsDLQ.Arn}
+  IdempotencyTableName: {Value: !Ref IdempotencyTable}

@@ -1,0 +1,35 @@
+{
+  "name": "aiops-mcp",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "github-follow-aiops-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --packages=external --platform=node --format=esm --outfile=dist/index.js --banner:js='#!/usr/bin/env node'",
+    "check-types": "tsc -b",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@aws-crypto/sha256-js": "^5.2.0",
+    "@aws-sdk/client-cloudwatch": "^3.848.0",
+    "@aws-sdk/client-cloudwatch-logs": "^3.848.0",
+    "@aws-sdk/client-codedeploy": "^3.848.0",
+    "@aws-sdk/client-dynamodb": "^3.848.0",
+    "@aws-sdk/client-sqs": "^3.848.0",
+    "@aws-sdk/client-synthetics": "^3.848.0",
+    "@aws-sdk/credential-provider-node": "^3.972.70",
+    "@aws-sdk/lib-dynamodb": "^3.848.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@smithy/protocol-http": "^5.5.11",
+    "@smithy/signature-v4": "^5.6.7",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@github-repositories-fllow/config": "workspace:*",
+    "@types/node": "^22.13.14",
+    "esbuild": "^0.25.6",
+    "tsx": "^4.19.2",
+    "typescript": "catalog:"
+  }
+}
