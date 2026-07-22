@@ -11,9 +11,12 @@ import (
 
 	"github.com/PrettyKing/github-repositories-fllow/apps/go-api/internal/config"
 	"github.com/PrettyKing/github-repositories-fllow/apps/go-api/internal/database"
+	"github.com/PrettyKing/github-repositories-fllow/apps/go-api/internal/events"
 	"github.com/PrettyKing/github-repositories-fllow/apps/go-api/internal/github"
 	"github.com/PrettyKing/github-repositories-fllow/apps/go-api/internal/handler"
 	"github.com/PrettyKing/github-repositories-fllow/apps/go-api/internal/repository"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/sns"
 )
 
 func main() {
@@ -40,7 +43,15 @@ func main() {
 
 	mux := http.NewServeMux()
 	githubClient := github.NewClient(&http.Client{Timeout: 15 * time.Second})
-	userHandler := handler.NewGitHubUserHandler(repository.NewGitHubUserRepository(db), githubClient)
+	publisher := events.Publisher(events.NoopPublisher{})
+	if topicARN := os.Getenv("GITHUB_EVENTS_TOPIC_ARN"); topicARN != "" {
+		awsConfig, err := awsconfig.LoadDefaultConfig(context.Background())
+		if err != nil {
+			log.Fatalf("load AWS configuration: %v", err)
+		}
+		publisher = events.SNSPublisher{Client: sns.NewFromConfig(awsConfig), TopicARN: topicARN}
+	}
+	userHandler := handler.NewGitHubUserHandler(repository.NewGitHubUserRepository(db), githubClient, publisher)
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
