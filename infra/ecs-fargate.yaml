@@ -204,17 +204,6 @@ Resources:
         - !ImportValue
           Fn::Sub: "${MainStackName}-PrivateSubnet2"
 
-  GoApiAlbRecord:
-    Type: AWS::Route53::RecordSet
-    Properties:
-      HostedZoneId: !GetAtt CloudMapNamespace.HostedZoneId
-      Name: !Sub "go-api-alb.${MainStackName}.internal"
-      Type: A
-      AliasTarget:
-        DNSName: !GetAtt Alb.DNSName
-        HostedZoneId: !GetAtt Alb.CanonicalHostedZoneID
-        EvaluateTargetHealth: true
-
   # Blue 目标组。ECS 在每次部署后会交换蓝/绿角色。
   EcsTargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
@@ -656,8 +645,8 @@ Outputs:
     Description: Legacy direct service-discovery name retained for rollback
     Value: !Sub "go-api.${MainStackName}.internal"
   GoApiPrivateUrl:
-    Description: Stable private production URL routed through ECS native Canary
-    Value: !Sub "http://go-api-alb.${MainStackName}.internal"
+    Description: Stable private ALB DNS routed through ECS native Canary
+    Value: !Sub "http://${Alb.DNSName}"
   CanaryStrategy:
     Condition: IsCanaryEnabled
     Value: "10 percent for 10 minutes, then 100 percent; 5 minute final bake"
