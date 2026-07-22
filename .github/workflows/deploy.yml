@@ -65,7 +65,7 @@ jobs:
           SYNTHETICS_ALARM=$(aws cloudformation describe-stacks --stack-name "$OBSERVABILITY_STACK" \
             --query "Stacks[0].Outputs[?OutputKey=='CanarySuccessAlarmName'].OutputValue | [0]" \
             --output text 2>/dev/null || true)
-          EXTRA_PARAMETERS=()
+          EXTRA_PARAMETERS=("ApiCodeSha256=${GITHUB_SHA}")
           if [ -n "$SYNTHETICS_ALARM" ] && [ "$SYNTHETICS_ALARM" != "None" ]; then
             EXTRA_PARAMETERS+=("SyntheticsAlarmName=${SYNTHETICS_ALARM}")
           fi

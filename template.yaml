@@ -47,6 +47,10 @@ Parameters:
     Type: String
     Default: ""
     Description: Private Go API origin. The ECS stack exports the Canary-managed ALB URL.
+  ApiCodeSha256:
+    Type: String
+    Default: bootstrap
+    Description: Immutable build fingerprint used to force a new Lambda version for each release.
 
 Globals:
   Function:
@@ -300,6 +304,7 @@ Resources:
       Policies:
         - AWSLambdaVPCAccessExecutionRole
       AutoPublishAlias: live
+      AutoPublishCodeSha256: !Ref ApiCodeSha256
       DeploymentPreference:
         Type: Canary10Percent10Minutes
         Role: !GetAtt CanaryCodeDeployRole.Arn
