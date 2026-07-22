@@ -256,6 +256,32 @@ Resources:
       DBInstanceClass: db.serverless
       Engine: aurora-postgresql
 
+  # SAM 默认生成的 CodeDeploy 角色不会带权限边界，因此改为显式创建。
+  CanaryCodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !Sub "arn:aws:iam::${AWS::AccountId}:policy/${LambdaBoundaryName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codedeploy.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaCanaryDeployment
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarms
+                  - lambda:UpdateAlias
+                  - lambda:GetAlias
+                  - lambda:GetProvisionedConcurrencyConfig
+                  - lambda:InvokeFunction
+                  - sns:Publish
+                Resource: "*"
+
   # ──────────────────────────── Lambda(Hono) + HTTP API ────────────────────────────
   ApiFunction:
     Type: AWS::Serverless::Function
@@ -271,6 +297,7 @@ Resources:
       AutoPublishAlias: live
       DeploymentPreference:
         Type: Canary10Percent10Minutes
+        Role: !GetAtt CanaryCodeDeployRole.Arn
         Alarms: !If
           - HasSyntheticsAlarm
           - [!Sub "${AWS::StackName}-api-alias-errors", !Sub "${AWS::StackName}-api-5xx", !Ref SyntheticsAlarmName]

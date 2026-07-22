@@ -98,6 +98,9 @@ Resources:
               - synthetics:GetCanary
               - synthetics:GetCanaryRuns
               - lambda:InvokeFunction
+              - lambda:UpdateAlias
+              - lambda:GetAlias
+              - lambda:GetProvisionedConcurrencyConfig
               - codedeploy:GetDeployment
               - codedeploy:GetDeploymentGroup
               - codedeploy:ListDeployments
