@@ -119,6 +119,9 @@ Resources:
   ConsoleRoute:
     Type: AWS::ApiGatewayV2::Route
     Properties: { ApiId: !Ref ConsoleApi, RouteKey: "$default", Target: !Sub "integrations/${ConsoleIntegration}", AuthorizationType: JWT, AuthorizerId: !Ref ConsoleAuthorizer }
+  ConsolePreflightRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties: { ApiId: !Ref ConsoleApi, RouteKey: "OPTIONS /{proxy+}", Target: !Sub "integrations/${ConsoleIntegration}", AuthorizationType: NONE }
   ConsoleStage:
     Type: AWS::ApiGatewayV2::Stage
     Properties: { ApiId: !Ref ConsoleApi, StageName: "$default", AutoDeploy: true }

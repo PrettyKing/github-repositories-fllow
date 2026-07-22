@@ -22,6 +22,7 @@ const queueUrl = (arn: string) => { const p = arn.split(":"); return `https://sq
 export const handler = async (event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> => {
   const c = config(); const method = event.requestContext.http.method; const path = event.rawPath;
   try {
+    if (method === "OPTIONS") return { statusCode: 204 };
     if (method === "GET" && path === "/overview") {
       const [alarmResult, canaries, dlqs, deploymentResults, incidentResult] = await Promise.all([
         cw.send(new DescribeAlarmsCommand({ StateValue: "ALARM", MaxRecords: 50 })),
