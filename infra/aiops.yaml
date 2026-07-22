@@ -121,7 +121,6 @@ Resources:
       CodeUri: ../apps/aiops-agent/dist
       Handler: orchestrator.handler
       Role: !GetAtt OrchestratorRole.Arn
-      ReservedConcurrentExecutions: 2
       Environment: { Variables: { BEDROCK_AGENT_ID: !Ref AIOpsAgent, BEDROCK_AGENT_ALIAS_ID: !GetAtt AIOpsAgentAlias.AgentAliasId } }
       Events:
         AlarmStateChange:
@@ -134,7 +133,7 @@ Resources:
     Properties: { CodeUri: ../apps/aiops-agent/dist, Handler: actions.handler, Role: !GetAtt ActionRole.Arn }
   ExecutorFunction:
     Type: AWS::Serverless::Function
-    Properties: { CodeUri: ../apps/aiops-agent/dist, Handler: executor.handler, Role: !GetAtt ExecutorRole.Arn, ReservedConcurrentExecutions: 1 }
+    Properties: { CodeUri: ../apps/aiops-agent/dist, Handler: executor.handler, Role: !GetAtt ExecutorRole.Arn }
   ApprovalApiFunction:
     Type: AWS::Serverless::Function
     Properties:
