@@ -37,12 +37,20 @@ jobs:
           API_FN=$(aws cloudformation describe-stack-resources --stack-name "$MAIN_STACK" --query "StackResources[?LogicalResourceId=='ApiFunction'].PhysicalResourceId|[0]" --output text)
           APP=$(aws cloudformation describe-stack-resources --stack-name "$MAIN_STACK" --query "StackResources[?ResourceType=='AWS::CodeDeploy::Application'].PhysicalResourceId|[0]" --output text)
           GROUP=$(aws cloudformation describe-stack-resources --stack-name "$MAIN_STACK" --query "StackResources[?ResourceType=='AWS::CodeDeploy::DeploymentGroup'].PhysicalResourceId|[0]" --output text)
+          PARAMS=(
+            IncidentTableName="$TABLE"
+            TestTopicArn="$TOPIC"
+            AllowedDlqArns="$DLQ"
+            AllowedAlarms="${MAIN_STACK}-api-5xx,${MAIN_STACK}-api-alias-errors"
+            AllowedLogGroups="/aws/lambda/${API_FN},/aws/lambda/${MAIN_STACK}-event-consumer"
+            AllowedDeploymentGroups="${APP}/${GROUP}"
+          )
+          if [[ -n "$ADMIN_EMAIL" ]]; then
+            PARAMS+=(AdminEmail="$ADMIN_EMAIL")
+          fi
           sam deploy --template-file infra/aiops-console.yaml --stack-name "$CONSOLE_STACK" --resolve-s3 \
             --capabilities CAPABILITY_NAMED_IAM --no-confirm-changeset --no-fail-on-empty-changeset \
-            --parameter-overrides AdminEmail="$ADMIN_EMAIL" IncidentTableName="$TABLE" TestTopicArn="$TOPIC" \
-              AllowedDlqArns="$DLQ" AllowedAlarms="${MAIN_STACK}-api-5xx,${MAIN_STACK}-api-alias-errors" \
-              AllowedLogGroups="/aws/lambda/${API_FN},/aws/lambda/${MAIN_STACK}-event-consumer" \
-              AllowedDeploymentGroups="${APP}/${GROUP}"
+            --parameter-overrides "${PARAMS[@]}"
       - name: Publish console assets
         run: |
           set -euo pipefail
