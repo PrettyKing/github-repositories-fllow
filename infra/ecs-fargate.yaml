@@ -2,6 +2,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Go API on ECS Fargate with native 10 percent canary deployments, an internal
   ALB, two target groups, alarm rollback and stable private DNS.
+  Release flow includes a private Green validation listener and lifecycle hook.
   This stack imports the VPC/subnets/DB from the main stack (template.yaml) and
   does not recreate any network or database resource.
 
