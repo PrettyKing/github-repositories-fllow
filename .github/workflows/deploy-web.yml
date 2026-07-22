@@ -109,3 +109,22 @@ jobs:
               "$BASE" --data "$(jq -nc --arg name "$WEB_DOMAIN" '{name:$name}')" >/dev/null
             echo "Attached $WEB_DOMAIN"
           fi
+
+      - name: Configure production domain DNS
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          API="https://api.cloudflare.com/client/v4"
+          AUTH=(-H "Authorization: Bearer ${CF_API_TOKEN}" -H "content-type: application/json")
+          ZONE_ID=$(curl -fsS "${AUTH[@]}" "$API/zones?name=faithcal.xyz" | jq -er '.result[0].id')
+          RECORDS="$API/zones/${ZONE_ID}/dns_records"
+          RECORD_ID=$(curl -fsS "${AUTH[@]}" "$RECORDS?type=CNAME&name=$WEB_DOMAIN" | jq -r '.result[0].id // empty')
+          BODY=$(jq -nc --arg name "$WEB_DOMAIN" --arg target "${PAGES_PROJECT}.pages.dev" \
+            '{type:"CNAME",name:$name,content:$target,ttl:1,proxied:true}')
+          if [[ -n "$RECORD_ID" ]]; then
+            curl -fsS -X PUT "${AUTH[@]}" "$RECORDS/$RECORD_ID" --data "$BODY" >/dev/null
+          else
+            curl -fsS -X POST "${AUTH[@]}" "$RECORDS" --data "$BODY" >/dev/null
+          fi
+          echo "Configured $WEB_DOMAIN DNS"
