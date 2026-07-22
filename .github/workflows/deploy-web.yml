@@ -20,6 +20,7 @@ env:
   AWS_REGION: ap-northeast-1
   MAIN_STACK: github-repositories-fllow
   PAGES_PROJECT: github-repositories-fllow-web
+  WEB_DOMAIN: app.faithcal.xyz
 
 jobs:
   deploy:
@@ -93,3 +94,18 @@ jobs:
           # 首次自动建 Direct-Upload 项目（已存在则忽略），再部署 out/
           npx --yes wrangler@3 pages project create "$PAGES_PROJECT" --production-branch main || true
           npx --yes wrangler@3 pages deploy out --project-name="$PAGES_PROJECT" --branch=main
+
+      - name: Attach production custom domain
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          BASE="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${PAGES_PROJECT}/domains"
+          if curl -fsS -H "Authorization: Bearer $CF_API_TOKEN" "$BASE" | jq -e --arg domain "$WEB_DOMAIN" '.result[] | select(.name == $domain)' >/dev/null; then
+            echo "$WEB_DOMAIN is already attached"
+          else
+            curl -fsS -X POST -H "Authorization: Bearer $CF_API_TOKEN" -H "content-type: application/json" \
+              "$BASE" --data "$(jq -nc --arg name "$WEB_DOMAIN" '{name:$name}')" >/dev/null
+            echo "Attached $WEB_DOMAIN"
+          fi
