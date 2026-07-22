@@ -5,7 +5,7 @@
 | 日期 | 版本 | 说明 |
 | --- | --- | --- |
 | 2026-07-21 | v1 | 初始设计 |
-| 2026-07-22 | v2 | UI 独立为 React/Tailwind Console，部署到 CloudFront + Cognito |
+| 2026-07-22 | v2 | UI 独立为 React/Tailwind Console，Cloudflare Pages 托管并使用 AWS Cognito |
 
 ## 项目架构
 
@@ -43,7 +43,7 @@ Action Group Lambda 采用函数定义，首版工具：
 
 ### 模块 4: Console API/UI 与 Agent 自监控（F-006 / F-007）
 
-`apps/aiops-console` 使用 React 19、TypeScript、Vite 和 Tailwind CSS v4。生产静态资源位于私有 S3，通过 CloudFront Origin Access Control 访问；管理员使用 Cognito Hosted UI 的 OAuth2 Code + PKCE 登录。HTTP API JWT Authorizer 校验 Cognito ID Token 后，才允许访问独立 Console API Lambda。
+`apps/aiops-console` 使用 React 19、TypeScript、Vite 和 Tailwind CSS v4，生产静态资源部署到独立 Cloudflare Pages 项目。管理员使用 AWS Cognito Hosted UI 的 OAuth2 Code + PKCE 登录。HTTP API JWT Authorizer 校验 Cognito ID Token 后，才允许访问独立 Console API Lambda。
 
 Console API 提供 `/overview`、`/logs`、`/incidents/:id` 和 `/queue-tests`。它只具备环境 allowlist 内的 CloudWatch、Synthetics、SQS、CodeDeploy、DynamoDB 只读权限，以及向指定测试 SNS Topic 发布固定安全事件的权限。浏览器不持有 AWS 凭据，也不复用业务 Hono Lambda 的 Basic Auth。
 

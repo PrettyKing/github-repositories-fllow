@@ -1,9 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Cognito-authenticated AWS-hosted AI Ops administrator console.
+Description: Cognito-authenticated AI Ops API for the Cloudflare Pages console.
 
 Parameters:
   AdminEmail: { Type: String, Default: "", Description: Optional initial administrator email. }
+  ConsoleUrl: { Type: String, Description: HTTPS origin of the Cloudflare Pages console without a trailing slash. }
   RuntimeBoundaryName: { Type: String, Default: github-repositories-fllow-lambda-boundary }
   IncidentTableName: { Type: String }
   TestTopicArn: { Type: String }
@@ -18,57 +19,6 @@ Conditions:
   HasAdminEmail: !Not [!Equals [!Ref AdminEmail, ""]]
 
 Resources:
-  ConsoleBucket:
-    Type: AWS::S3::Bucket
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      BucketEncryption: { ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }] }
-      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
-      VersioningConfiguration: { Status: Enabled }
-
-  ConsoleOriginAccessControl:
-    Type: AWS::CloudFront::OriginAccessControl
-    Properties:
-      OriginAccessControlConfig: { Name: !Sub "${AWS::StackName}-oac", OriginAccessControlOriginType: s3, SigningBehavior: always, SigningProtocol: sigv4 }
-
-  ConsoleDistribution:
-    Type: AWS::CloudFront::Distribution
-    Properties:
-      DistributionConfig:
-        Enabled: true
-        HttpVersion: http2and3
-        DefaultRootObject: index.html
-        Origins:
-          - Id: console-s3
-            DomainName: !GetAtt ConsoleBucket.RegionalDomainName
-            OriginAccessControlId: !Ref ConsoleOriginAccessControl
-            S3OriginConfig: { OriginAccessIdentity: "" }
-        DefaultCacheBehavior:
-          TargetOriginId: console-s3
-          ViewerProtocolPolicy: redirect-to-https
-          AllowedMethods: [GET, HEAD, OPTIONS]
-          CachedMethods: [GET, HEAD, OPTIONS]
-          Compress: true
-          ForwardedValues: { QueryString: false, Cookies: { Forward: none } }
-        CustomErrorResponses:
-          - { ErrorCode: 403, ResponseCode: 200, ResponsePagePath: /index.html }
-          - { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: /index.html }
-        ViewerCertificate: { CloudFrontDefaultCertificate: true }
-
-  ConsoleBucketPolicy:
-    Type: AWS::S3::BucketPolicy
-    Properties:
-      Bucket: !Ref ConsoleBucket
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: { Service: cloudfront.amazonaws.com }
-            Action: s3:GetObject
-            Resource: !Sub "${ConsoleBucket.Arn}/*"
-            Condition: { StringEquals: { "AWS:SourceArn": !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${ConsoleDistribution}" } }
-
   AdminUserPool:
     Type: AWS::Cognito::UserPool
     Properties:
@@ -96,8 +46,8 @@ Resources:
       AllowedOAuthFlows: [code]
       AllowedOAuthScopes: [openid, email]
       SupportedIdentityProviders: [COGNITO]
-      CallbackURLs: [!Sub "https://${ConsoleDistribution.DomainName}/"]
-      LogoutURLs: [!Sub "https://${ConsoleDistribution.DomainName}/"]
+      CallbackURLs: [!Sub "${ConsoleUrl}/"]
+      LogoutURLs: [!Sub "${ConsoleUrl}/"]
 
   InitialAdmin:
     Type: AWS::Cognito::UserPoolUser
@@ -115,7 +65,7 @@ Resources:
       Name: !Sub "${AWS::StackName}-api"
       ProtocolType: HTTP
       CorsConfiguration:
-        AllowOrigins: [!Sub "https://${ConsoleDistribution.DomainName}"]
+        AllowOrigins: [!Ref ConsoleUrl]
         AllowHeaders: [authorization, content-type]
         AllowMethods: [GET, POST, OPTIONS]
 
@@ -177,9 +127,7 @@ Resources:
     Properties: { Action: lambda:InvokeFunction, FunctionName: !Ref ConsoleApiFunction, Principal: apigateway.amazonaws.com, SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ConsoleApi}/*" }
 
 Outputs:
-  ConsoleUrl: { Value: !Sub "https://${ConsoleDistribution.DomainName}/" }
-  ConsoleBucketName: { Value: !Ref ConsoleBucket }
-  DistributionId: { Value: !Ref ConsoleDistribution }
+  ConsoleUrl: { Value: !Sub "${ConsoleUrl}/" }
   ApiUrl: { Value: !Sub "https://${ConsoleApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}" }
   CognitoDomain: { Value: !Sub "github-fllow-aiops-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com" }
   CognitoClientId: { Value: !Ref AdminUserPoolClient }

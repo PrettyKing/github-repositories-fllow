@@ -209,10 +209,6 @@ Resources:
                   - route53:AssociateVPCWithHostedZone
                   - route53:DisassociateVPCFromHostedZone
                 Resource: "*"
-              - Sid: CloudFrontForAiOpsConsole
-                Effect: Allow
-                Action: cloudfront:*
-                Resource: "*"
               # S3 仅限 SAM 托管的构建产物桶
               - Sid: SamArtifactBucket
                 Effect: Allow

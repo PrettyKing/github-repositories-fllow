@@ -23,7 +23,7 @@
 3. [F-003] Agent 输出结构化 Incident：证据、时间线、根因假设、置信/不确定性、影响范围和建议动作；不得把推断表述为已验证事实。
 4. [F-004] DynamoDB 持久化 Incident、工具调用摘要、审批状态和执行结果，并设置合理保留期。
 5. [F-005] 支持 `request_dlq_redrive` 和 `request_rollback`，只创建待审批动作；批准后由独立执行角色调用 allowlist API。
-6. [F-006] 独立 React Console 提供系统健康、Incident 列表/详情、脱敏日志和安全队列测试；生产环境通过 CloudFront + Cognito + HTTP API JWT Authorizer 保护。
+6. [F-006] 独立 React Console 提供系统健康、Incident 列表/详情、脱敏日志和安全队列测试；前端由 Cloudflare Pages 托管，生产 API 通过 Cognito + HTTP API JWT Authorizer 保护。
 7. [F-007] 对 Agent 调用量、错误、延迟、Token 使用和恢复动作建立指标、告警和审计。
 
 ## 非功能需求

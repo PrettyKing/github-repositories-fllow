@@ -24,7 +24,7 @@
 ### 功能 3: API、UI 与可观测性
 
 - [x] T-007: 实现 Cognito JWT 保护的 Console API：Overview、日志、Incident 详情和安全消息链路测试 ~90min
-- [x] T-008: 实现独立 React/TypeScript/Tailwind Console，支持本地 Mock、CloudFront/S3 部署与 Cognito PKCE 登录 ~120min
+- [x] T-008: 实现独立 React/TypeScript/Tailwind Console，支持本地 Mock、Cloudflare Pages 部署与 Cognito PKCE 登录 ~120min
 - [ ] T-009: 增加 Agent 调用、错误、延迟、Token、工具失败和动作执行指标/告警/审计（已交付 Lambda 错误告警和结构化审计；Token/自定义指标待补） ~60min
 
 ### 集成与测试

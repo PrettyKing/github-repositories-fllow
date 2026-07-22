@@ -75,4 +75,4 @@
 - API 灰度仅覆盖 Hono Lambda，策略为 `Canary10Percent10Minutes`；ECS 蓝绿发布不在本期。
 - AWS AI Ops 采用 Bedrock Agent + Lambda Action Group；默认只读，redrive/rollback 必须人工审批并由独立角色执行。
 - 本地 MCP 为选做，使用 stdio + AWS SSO/Profile，写工具只创建云端审批申请。
-- AI Ops Console 为独立 React + Tailwind 应用，生产使用 CloudFront/S3 + Cognito/JWT；本地 Mock 模式不访问 AWS。它不属于 MCP，MCP 不提供 Web 页面或 HTTP 端口。
+- AI Ops Console 为独立 React + Tailwind 应用，生产前端使用 Cloudflare Pages，认证/API 使用 AWS Cognito/JWT；本地 Mock 模式不访问 AWS。它不属于 MCP，MCP 不提供 Web 页面或 HTTP 端口。

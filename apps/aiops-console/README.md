@@ -1,6 +1,6 @@
 # AWS AI Ops Console
 
-独立的 AWS 运维管理控制台，使用 React 19、TypeScript、Vite 和 Tailwind CSS v4。它与 `apps/aiops-mcp` 完全解耦：Console 面向浏览器管理员，MCP 面向本地 Agent Client 的 stdio 调用。
+独立的 AWS 运维管理控制台，使用 React 19、TypeScript、Vite 和 Tailwind CSS v4。静态前端托管在 Cloudflare Pages，Cognito、JWT HTTP API 和 Lambda 后端运行在 AWS。它与 `apps/aiops-mcp` 完全解耦：Console 面向浏览器管理员，MCP 面向本地 Agent Client 的 stdio 调用。
 
 ## 本地开发
 
@@ -25,9 +25,9 @@ pnpm --filter aiops-console build
 
 1. 构建 `aiops-agent` 的 Console API Lambda。
 2. 构建 React/Vite 静态资源。
-3. 使用 `infra/aiops-console.yaml` 部署 S3、CloudFront、Cognito、HTTP API 和 Lambda。
+3. 使用 `infra/aiops-console.yaml` 部署 Cognito、HTTP API 和 Lambda。
 4. 根据 CloudFormation 输出生成生产 `dist/config.js`，其中 `demoMode=false`。
-5. 同步 `dist/` 到私有 S3，并刷新 CloudFront。
+5. 将 `dist/` 发布到独立 Cloudflare Pages 项目。
 
 必需 GitHub Secrets：
 
@@ -53,5 +53,5 @@ pnpm --filter aiops-console build
 | `apiUrl` | Console HTTP API 地址 |
 | `cognitoDomain` | Cognito Hosted UI 域名 |
 | `clientId` | Cognito User Pool Client ID |
-| `redirectUri` | CloudFront Console URL |
+| `redirectUri` | Cloudflare Pages Console URL |
 | `demoMode` | 本地为 `true`，生产必须为 `false` |

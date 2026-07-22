@@ -136,7 +136,7 @@ Agent 以 CloudWatch Alarm 为事故入口，通过 EventBridge 启动 Orchestra
 
 ### 4.6 AI Ops 管理控制台
 
-`apps/aiops-console` 是独立的 React 19 + TypeScript + Tailwind CSS 管理控制台，由 Vite 构建后部署到私有 S3，并通过 CloudFront 对外提供 HTTPS。管理员使用 Cognito OAuth2 Code + PKCE 登录，React 使用 JWT 调用受 HTTP API Authorizer 保护的 Console API Lambda。
+`apps/aiops-console` 是独立的 React 19 + TypeScript + Tailwind CSS 管理控制台，由 Vite 构建后部署到 Cloudflare Pages。管理员使用 AWS Cognito OAuth2 Code + PKCE 登录，React 使用 JWT 调用受 HTTP API Authorizer 保护的 Console API Lambda。
 
 控制台提供系统健康摘要、CloudWatch 活跃告警、Synthetics Canary、DLQ 状态、CodeDeploy 记录、脱敏日志、最近 Incident 列表/详情，以及固定格式的 SNS→SQS→Consumer 安全测试事件。浏览器不持有 AWS 凭据，不接受任意 ARN、日志组或 Topic。
 

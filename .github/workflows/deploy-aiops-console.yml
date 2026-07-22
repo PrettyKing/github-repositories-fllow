@@ -11,6 +11,7 @@ env:
   MESSAGING_STACK: github-repositories-fllow-messaging
   AIOPS_STACK: github-repositories-fllow-aiops
   CONSOLE_STACK: github-repositories-fllow-aiops-console
+  PAGES_PROJECT: github-repositories-fllow-aiops
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -38,6 +39,7 @@ jobs:
           APP=$(aws cloudformation describe-stack-resources --stack-name "$MAIN_STACK" --query "StackResources[?ResourceType=='AWS::CodeDeploy::Application'].PhysicalResourceId|[0]" --output text)
           GROUP=$(aws cloudformation describe-stack-resources --stack-name "$MAIN_STACK" --query "StackResources[?ResourceType=='AWS::CodeDeploy::DeploymentGroup'].PhysicalResourceId|[0]" --output text)
           PARAMS=(
+            ConsoleUrl="https://${PAGES_PROJECT}.pages.dev"
             IncidentTableName="$TABLE"
             TestTopicArn="$TOPIC"
             AllowedDlqArns="$DLQ"
@@ -52,12 +54,15 @@ jobs:
             --capabilities CAPABILITY_NAMED_IAM --no-confirm-changeset --no-fail-on-empty-changeset \
             --parameter-overrides "${PARAMS[@]}"
       - name: Publish console assets
+        env:
+          CLOUDFLARE_API_TOKEN: "${{ secrets.CLOUDFLARE_API_TOKEN }}"
+          CLOUDFLARE_ACCOUNT_ID: "${{ secrets.CLOUDFLARE_ACCOUNT_ID }}"
         run: |
           set -euo pipefail
           outputs() { aws cloudformation describe-stacks --stack-name "$CONSOLE_STACK" --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue|[0]" --output text; }
-          BUCKET=$(outputs ConsoleBucketName); DIST=$(outputs DistributionId); API=$(outputs ApiUrl); DOMAIN=$(outputs CognitoDomain); CLIENT=$(outputs CognitoClientId); URL=$(outputs ConsoleUrl)
+          API=$(outputs ApiUrl); DOMAIN=$(outputs CognitoDomain); CLIENT=$(outputs CognitoClientId); URL=$(outputs ConsoleUrl)
           sed -e "s|__API_URL__|$API|g" -e "s|__COGNITO_DOMAIN__|$DOMAIN|g" -e "s|__COGNITO_CLIENT_ID__|$CLIENT|g" -e "s|__CONSOLE_URL__|$URL|g" apps/aiops-console/config.example.js > apps/aiops-console/dist/config.js
-          aws s3 sync apps/aiops-console/dist "s3://$BUCKET" --delete --cache-control "no-store"
-          aws cloudfront create-invalidation --distribution-id "$DIST" --paths "/*"
+          npx --yes wrangler@3 pages project create "$PAGES_PROJECT" --production-branch main || true
+          npx --yes wrangler@3 pages deploy apps/aiops-console/dist --project-name="$PAGES_PROJECT" --branch=main
           echo "### AI Ops Console" >> "$GITHUB_STEP_SUMMARY"
           echo "$URL" >> "$GITHUB_STEP_SUMMARY"

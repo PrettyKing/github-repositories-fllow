@@ -49,7 +49,7 @@ AI Ops Console 可独立启动：
 pnpm --filter aiops-console dev
 ```
 
-打开 `http://127.0.0.1:4322/`。本地默认展示安全 Mock 数据，不访问 AWS；生产环境使用 CloudFront、Cognito 和 JWT Console API。
+打开 `http://127.0.0.1:4322/`。本地默认展示安全 Mock 数据，不访问 AWS；生产前端托管在 Cloudflare Pages，认证和 API 使用 AWS Cognito 与 JWT Console API。
 
 ## UI Customization
 
