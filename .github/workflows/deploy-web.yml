@@ -12,6 +12,15 @@ on:
       - ".github/workflows/deploy-web.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-northeast-1
+  MAIN_STACK: github-repositories-fllow
+  PAGES_PROJECT: github-repositories-fllow-web
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -33,6 +42,47 @@ jobs:
       - name: Build static export (out/)
         run: pnpm --filter web build
 
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Configure Pages production API proxy
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          API_ENDPOINT=$(aws cloudformation describe-stacks --stack-name "$MAIN_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='ApiUrl'].OutputValue | [0]" --output text)
+          AUTH_ARN=$(aws cloudformation describe-stacks --stack-name "$MAIN_STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='AuthSecretArn'].OutputValue | [0]" --output text)
+          AUTH_JSON=$(aws secretsmanager get-secret-value --secret-id "$AUTH_ARN" \
+            --query SecretString --output text)
+          AUTH_USER=$(echo "$AUTH_JSON" | jq -r .username)
+          AUTH_PASSWORD=$(echo "$AUTH_JSON" | jq -r .password)
+          echo "::add-mask::$AUTH_USER"
+          echo "::add-mask::$AUTH_PASSWORD"
+
+          BASE="https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects"
+          CONFIG=$(jq -n --arg api "$API_ENDPOINT" --arg user "$AUTH_USER" --arg password "$AUTH_PASSWORD" '{
+            deployment_configs: { production: { env_vars: {
+              API_ORIGIN: { value: $api },
+              BASIC_AUTH_USER: { value: $user },
+              BASIC_AUTH_PASSWORD: { value: $password }
+            }}}
+          }')
+          if curl -fsS -H "Authorization: Bearer $CF_API_TOKEN" "${BASE}/${PAGES_PROJECT}" >/dev/null 2>&1; then
+            curl -fsS -X PATCH -H "Authorization: Bearer $CF_API_TOKEN" \
+              -H "content-type: application/json" "${BASE}/${PAGES_PROJECT}" \
+              --data "$CONFIG" >/dev/null
+          else
+            curl -fsS -X POST -H "Authorization: Bearer $CF_API_TOKEN" \
+              -H "content-type: application/json" "$BASE" \
+              --data "$(echo "$CONFIG" | jq --arg name "$PAGES_PROJECT" '. + {name:$name, production_branch:"main"}')" >/dev/null
+          fi
+
       # 直接用 npx wrangler（绕开 wrangler-action 在 pnpm workspace 里的安装问题）
       - name: Deploy to Cloudflare Pages
         working-directory: apps/web
@@ -41,5 +91,5 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           # 首次自动建 Direct-Upload 项目（已存在则忽略），再部署 out/
-          npx --yes wrangler@3 pages project create github-repositories-fllow-web --production-branch main || true
-          npx --yes wrangler@3 pages deploy out --project-name=github-repositories-fllow-web --branch=main
+          npx --yes wrangler@3 pages project create "$PAGES_PROJECT" --production-branch main || true
+          npx --yes wrangler@3 pages deploy out --project-name="$PAGES_PROJECT" --branch=main
