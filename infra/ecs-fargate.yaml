@@ -627,8 +627,12 @@ Resources:
               TestListenerRule: !Ref TestListenerRule
               RoleArn: !GetAtt EcsInfrastructureRole.Arn
             - !Ref AWS::NoValue
-      ServiceRegistries:
-        - RegistryArn: !GetAtt CloudMapService.Arn
+      # ECS 原生 CANARY 与 ServiceRegistries 互斥；Cloud Map 仅保留在首次
+      # 非 Canary 迁移阶段，生产流量切换后统一走 Internal ALB。
+      ServiceRegistries: !If
+        - IsCanaryEnabled
+        - !Ref AWS::NoValue
+        - - RegistryArn: !GetAtt CloudMapService.Arn
 
 Outputs:
   AlbUrl:
