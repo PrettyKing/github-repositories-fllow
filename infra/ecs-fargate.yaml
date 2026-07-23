@@ -627,6 +627,11 @@ Resources:
               TestListenerRule: !Ref TestListenerRule
               RoleArn: !GetAtt EcsInfrastructureRole.Arn
             - !Ref AWS::NoValue
+      # CloudFormation 不会因省略字段而清除旧注册；Canary 模式显式传空数组。
+      ServiceRegistries: !If
+        - IsCanaryEnabled
+        - []
+        - - RegistryArn: !GetAtt CloudMapService.Arn
 
 Outputs:
   AlbUrl:
